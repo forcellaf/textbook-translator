@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Intermediate / generated pipeline state
+# (folders are ignored but kept in the repo via .gitkeep)
+data/work/*
+!data/work/.gitkeep
+data/output/*
+!data/output/.gitkeep
+logs/*
+!logs/.gitkeep
