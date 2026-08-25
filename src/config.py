@@ -55,3 +55,39 @@ TARGET_LANG: str = os.getenv("TARGET_LANG", "English")
 MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "3000"))
 API_MAX_RETRIES: int = int(os.getenv("API_MAX_RETRIES", "5"))
 MAX_HEAL_ATTEMPTS: int = int(os.getenv("MAX_HEAL_ATTEMPTS", "3"))
+
+# ── MinerU (PDF -> Markdown) ────────────────────────────────────────────────
+# `MINERU_MODE` selects the default parsing backend for `src.parser.parse_pdf`:
+#   "cloud" (default) - MinerU Cloud API (v4), fast, no local GPU/CPU cost.
+#   "local"           - local `magic_pdf` library (kept for future CUDA use).
+# Neither MINERU_API_KEY nor DEEPSEEK_API_KEY are validated here (unlike
+# GEMINI_API_KEY above) because not every invocation needs them (e.g. running
+# only the local parser, or only the translator). Each client validates its
+# own required key lazily, at construction time.
+MINERU_MODE: str = os.getenv("MINERU_MODE", "cloud").lower()
+MINERU_API_KEY: str | None = os.getenv("MINERU_API_KEY")
+MINERU_API_BASE: str = os.getenv("MINERU_API_BASE", "https://mineru.net/api/v4").rstrip("/")
+MINERU_MAX_FILE_MB: int = int(os.getenv("MINERU_MAX_FILE_MB", "200"))
+MINERU_POLL_INTERVAL_SECONDS: int = int(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "10"))
+MINERU_TIMEOUT_MINUTES: int = int(os.getenv("MINERU_TIMEOUT_MINUTES", "30"))
+# One of "pipeline", "vlm", "MinerU-HTML" (per MinerU v4 "precision parse" API).
+MINERU_MODEL_VERSION: str = os.getenv("MINERU_MODEL_VERSION", "vlm")
+# Upload to Aliyun OSS can be slow/unstable on some networks; these control
+# how patiently/persistently we retry the raw PUT upload.
+MINERU_UPLOAD_MAX_RETRIES: int = int(os.getenv("MINERU_UPLOAD_MAX_RETRIES", "5"))
+MINERU_UPLOAD_TIMEOUT_SECONDS: float = float(os.getenv("MINERU_UPLOAD_TIMEOUT_SECONDS", "900"))
+
+# ── DeepSeek (translation) ──────────────────────────────────────────────────
+DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# ── PDF splitting (src.splitter / src.merger / src.chapter_splitter) ───────
+# MinerU's Precision Extract API hard-limits uploads to <= 200 pages and
+# <= 200 MB per file. Large textbooks are pre-split into overlapping chunks
+# before parsing, then the resulting per-chunk Markdown is merged back
+# together. See src/parser.py::parse_book for the orchestrator.
+PDF_SPLIT_ENABLED: bool = os.getenv("PDF_SPLIT_ENABLED", "true").lower() in ("1", "true", "yes")
+SPLIT_MAX_PAGES: int = int(os.getenv("SPLIT_MAX_PAGES", "190"))  # API hard limit 200
+SPLIT_MAX_SIZE_MB: int = int(os.getenv("SPLIT_MAX_SIZE_MB", "180"))  # API hard limit 200 MB
+SPLIT_OVERLAP_PAGES: int = int(os.getenv("SPLIT_OVERLAP_PAGES", "2"))

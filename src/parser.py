@@ -109,11 +109,14 @@ def _quiet_mineru_logging() -> None:
 _quiet_mineru_logging()
 
 
-def parse_pdf(pdf_filename: str) -> Path:
+def parse_pdf_local(pdf_filename: str) -> Path:
     """
-    Convert a PDF in data/input/ to Markdown using MinerU.
+    Convert a PDF in data/input/ to Markdown using the local MinerU
+    (`magic_pdf`) library.
 
-    Automatically uses GPU if CUDA is available, otherwise CPU.
+    Automatically uses GPU if CUDA is available, otherwise CPU. This path is
+    CPU-slow and lower quality than the cloud API, but is kept available for
+    offline use and future CUDA testing.
 
     Args:
         pdf_filename: Name of file in data/input/ (e.g., "calculus.pdf")
@@ -131,6 +134,26 @@ def parse_pdf(pdf_filename: str) -> Path:
 
     book_name = pdf_path.stem.replace(" ", "_")
     work_dir = DATA_WORK / book_name
+    return _parse_pdf_path_local(pdf_path, work_dir)
+
+
+def _parse_pdf_path_local(pdf_path: Path, work_dir: Path) -> Path:
+    """
+    Core local-MinerU parse logic, decoupled from data/input/ naming
+    conventions so it can be reused for both whole-book parsing
+    (`parse_pdf_local`) and per-chunk parsing of a split PDF
+    (`parse_book`), which lives outside data/input/.
+
+    Args:
+        pdf_path: Path to the PDF to parse (need not be in DATA_INPUT).
+        work_dir: Directory to write `full.md` and `images/` into.
+
+    Returns:
+        Path to the generated full.md
+
+    Raises:
+        RuntimeError: If MinerU processing fails or produces empty output
+    """
     images_dir = work_dir / "images"
     md_path = work_dir / "full.md"
 
@@ -142,6 +165,7 @@ def parse_pdf(pdf_filename: str) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    pdf_filename = pdf_path.name
     try:
         from magic_pdf.config.enums import SupportedPdfParseMethod
         from magic_pdf.data.data_reader_writer import FileBasedDataWriter
@@ -164,6 +188,7 @@ def parse_pdf(pdf_filename: str) -> Path:
             ocr=use_ocr,
             formula_enable=True,
             table_enable=True,
+            lang="ch"
         )
 
         # Force the OCR pipe mode to generate the markdown
@@ -186,3 +211,249 @@ def parse_pdf(pdf_filename: str) -> Path:
         )
 
     return md_path
+
+
+def parse_pdf_cloud(pdf_filename: str) -> Path:
+    """
+    Convert a PDF in data/input/ to Markdown using the MinerU Cloud API (v4).
+
+    Uploads the PDF, polls for completion, and downloads the resulting
+    markdown. This is the default/primary path: faster and higher quality
+    than the local CPU pipeline. Raw responses and the final markdown are
+    mirrored to data/work/{filename}/ for debugging.
+
+    Args:
+        pdf_filename: Name of file in data/input/ (e.g., "calculus.pdf")
+
+    Returns:
+        Path to the generated cloud_full.md
+
+    Raises:
+        FileNotFoundError: If the input PDF doesn't exist
+        RuntimeError: If MINERU_API_KEY is missing or the API call fails
+        TimeoutError: If the cloud task does not complete in time
+    """
+    pdf_path = DATA_INPUT / pdf_filename
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"Input PDF not found: {pdf_path}")
+
+    book_name = pdf_path.stem.replace(" ", "_")
+    work_dir = DATA_WORK / book_name
+    return _parse_pdf_path_cloud(pdf_path, work_dir)
+
+
+def _parse_pdf_path_cloud(pdf_path: Path, work_dir: Path) -> Path:
+    """
+    Core MinerU-Cloud parse logic, decoupled from data/input/ naming
+    conventions so it can be reused for both whole-book parsing
+    (`parse_pdf_cloud`) and per-chunk parsing of a split PDF
+    (`parse_book`), which lives outside data/input/.
+
+    Args:
+        pdf_path: Path to the PDF to parse (need not be in DATA_INPUT).
+        work_dir: Directory to write `cloud_full.md` (and debug artifacts)
+            into.
+
+    Returns:
+        Path to the generated cloud_full.md
+
+    Raises:
+        RuntimeError: If MINERU_API_KEY is missing or the API call fails
+        TimeoutError: If the cloud task does not complete in time
+    """
+    from src.mineru_client import MinerUCloudClient, MinerUCloudError
+
+    pdf_filename = pdf_path.name
+    md_path = work_dir / "cloud_full.md"
+
+    # ── Idempotency: skip re-parsing if already done and up to date ────────
+    if md_path.exists() and md_path.stat().st_mtime > pdf_path.stat().st_mtime:
+        logger.info("Already parsed (cloud), skipping: %s", md_path)
+        return md_path
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with MinerUCloudClient(work_dir=work_dir) as client:
+            task_id = client.upload_pdf(str(pdf_path))
+            markdown = client.wait_for_completion(
+                task_id, timeout_minutes=os_env_timeout_minutes()
+            )
+    except MinerUCloudError as exc:
+        raise RuntimeError(
+            f"MinerU Cloud failed to parse '{pdf_filename}': {exc}\n"
+            "Try again, or retry with --mode local to use the local pipeline."
+        ) from exc
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"{exc}\nRetry later, or use --mode local to use the local pipeline."
+        ) from exc
+
+    md_path.write_text(markdown, encoding="utf-8")
+
+    if not md_path.exists() or md_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"MinerU Cloud produced empty or missing output for '{pdf_filename}' "
+            f"at {md_path}"
+        )
+
+    return md_path
+
+
+def os_env_timeout_minutes() -> int:
+    """Small indirection so timeout can be tuned via MINERU_TIMEOUT_MINUTES."""
+    from src.config import MINERU_TIMEOUT_MINUTES
+
+    return MINERU_TIMEOUT_MINUTES
+
+
+def parse_pdf(pdf_filename: str, mode: str | None = None) -> Path:
+    """
+    Unified entry point: convert a PDF in data/input/ to Markdown, routing to
+    the cloud API or the local MinerU library.
+
+    Args:
+        pdf_filename: Name of file in data/input/ (e.g., "calculus.pdf")
+        mode: "cloud" or "local". Defaults to the MINERU_MODE env var
+            (itself defaulting to "cloud") when not given.
+
+    Returns:
+        Path to the generated markdown file (cloud_full.md or full.md).
+
+    Raises:
+        ValueError: If mode is neither "cloud" nor "local"
+        FileNotFoundError: If the input PDF doesn't exist
+        RuntimeError: If parsing fails
+    """
+    from src.config import MINERU_MODE
+
+    resolved_mode = (mode or MINERU_MODE or "cloud").lower()
+
+    if resolved_mode == "cloud":
+        return parse_pdf_cloud(pdf_filename)
+    if resolved_mode == "local":
+        return parse_pdf_local(pdf_filename)
+
+    raise ValueError(
+        f"Unknown MinerU mode '{resolved_mode}'. Expected 'cloud' or 'local'."
+    )
+
+
+def _parse_pdf_path(pdf_path: Path, work_dir: Path, mode: str) -> Path:
+    """Dispatch a single already-resolved PDF path to the cloud or local
+    MinerU backend. Shared by `parse_pdf` (via the filename-based wrappers
+    above) and `parse_book`'s per-chunk parsing."""
+    if mode == "cloud":
+        return _parse_pdf_path_cloud(pdf_path, work_dir)
+    if mode == "local":
+        return _parse_pdf_path_local(pdf_path, work_dir)
+    raise ValueError(f"Unknown MinerU mode '{mode}'. Expected 'cloud' or 'local'.")
+
+
+def parse_book(pdf_filename: str, mode: str | None = None) -> Path:
+    """
+    Orchestrator entry point: convert a PDF in data/input/ to a single
+    merged Markdown file, transparently splitting it first if it exceeds
+    MinerU's Precision Extract API limits (<= `SPLIT_MAX_PAGES` pages,
+    <= `SPLIT_MAX_SIZE_MB` MB).
+
+    Behavior:
+        * If `PDF_SPLIT_ENABLED` is False, or the PDF is within both
+          limits, this simply delegates to `parse_pdf` (identical output,
+          identical behavior -- no splitting/merging overhead).
+        * Otherwise: the PDF is split into overlapping page-range chunks
+          (`src.splitter.split_pdf`), each chunk is parsed with the same
+          MinerU backend used elsewhere in this module (into
+          `data/work/<book>/chunks/<chunk_stem>/`), and the per-chunk
+          Markdown is merged back into `data/work/<book>/merged.md`
+          (`src.merger.merge_chunks`), which is what's returned.
+
+    Args:
+        pdf_filename: Name of file in data/input/ (e.g., "calculus.pdf")
+        mode: "cloud" or "local". Defaults to the MINERU_MODE env var
+            (itself defaulting to "cloud") when not given.
+
+    Returns:
+        Path to the final markdown for the whole book: either the plain
+        `parse_pdf` output (full.md/cloud_full.md) when no split was
+        needed, or `merged.md` when it was.
+
+    Raises:
+        ValueError: If mode is neither "cloud" nor "local"
+        FileNotFoundError: If the input PDF doesn't exist
+        RuntimeError: If the PDF is encrypted, unreadable, or parsing fails
+    """
+    import pymupdf
+
+    from src.config import (
+        MINERU_MODE,
+        PDF_SPLIT_ENABLED,
+        SPLIT_MAX_PAGES,
+        SPLIT_MAX_SIZE_MB,
+        SPLIT_OVERLAP_PAGES,
+    )
+    from src.merger import merge_chunks
+    from src.splitter import split_pdf
+
+    pdf_path = DATA_INPUT / pdf_filename
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"Input PDF not found: {pdf_path}")
+
+    resolved_mode = (mode or MINERU_MODE or "cloud").lower()
+    if resolved_mode not in ("cloud", "local"):
+        raise ValueError(
+            f"Unknown MinerU mode '{resolved_mode}'. Expected 'cloud' or 'local'."
+        )
+
+    try:
+        with pymupdf.open(pdf_path) as doc:
+            page_count = doc.page_count
+    except Exception as exc:  # noqa: BLE001 - re-raised with context below
+        raise RuntimeError(f"Failed to open PDF '{pdf_path}': {exc}") from exc
+
+    size_mb = pdf_path.stat().st_size / (1024 * 1024)
+    within_limits = page_count <= SPLIT_MAX_PAGES and size_mb <= SPLIT_MAX_SIZE_MB
+
+    if not PDF_SPLIT_ENABLED or within_limits:
+        logger.info(
+            "'%s' (%d pages, %.1f MB) is within limits or splitting is disabled; "
+            "parsing directly",
+            pdf_filename,
+            page_count,
+            size_mb,
+        )
+        return parse_pdf(pdf_filename, mode=resolved_mode)
+
+    logger.info(
+        "'%s' (%d pages, %.1f MB) exceeds split limits (%d pages / %d MB); splitting first",
+        pdf_filename,
+        page_count,
+        size_mb,
+        SPLIT_MAX_PAGES,
+        SPLIT_MAX_SIZE_MB,
+    )
+
+    book_name = pdf_path.stem.replace(" ", "_")
+    book_work_dir = DATA_WORK / book_name
+    chunks_dir = book_work_dir / "chunks"
+
+    split_result = split_pdf(
+        pdf_path,
+        chunks_dir,
+        max_pages=SPLIT_MAX_PAGES,
+        max_size_mb=SPLIT_MAX_SIZE_MB,
+        overlap_pages=SPLIT_OVERLAP_PAGES,
+    )
+
+    for chunk in split_result.chunks:
+        chunk_work_dir = chunks_dir / chunk.output_path.stem
+        logger.info(
+            "Parsing chunk %d/%d (pages %d-%d)...",
+            chunk.index,
+            len(split_result.chunks),
+            chunk.start_page,
+            chunk.end_page,
+        )
+        _parse_pdf_path(chunk.output_path, chunk_work_dir, resolved_mode)
+
+    return merge_chunks(list(split_result.chunks), book_work_dir)
