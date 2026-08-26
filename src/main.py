@@ -11,10 +11,16 @@ Pipeline
     2. translate_markdown(md, lang)   -> translated markdown text
     3. write data/output/{name}_translated.md
 
-Note: translation is not wired up yet (`src/translator.py` is still a stub
-under active development). Until it lands, this pipeline falls back to
-passing the parsed markdown through untranslated so the parse step can be
-exercised end-to-end; a clear warning is logged when that happens.
+Translation is implemented in `src/translator.py`. This entry point runs the
+whole-document path (`translate_markdown`), which chunks the Markdown and
+translates it chunk by chunk. For a full book, prefer
+`src.translator.translate_book`, which adds per-chapter checkpointing,
+book-level profiling (`src.profiler`) and optional LaTeX output
+(`src.latex`).
+
+The passthrough fallback below is kept as a safety net: if `src.translator`
+cannot be imported at all, the parse step still produces output, with a clear
+warning that the text was left untranslated.
 """
 
 from __future__ import annotations
@@ -31,7 +37,8 @@ logger = logging.getLogger(__name__)
 
 def _get_translate_fn():
     """Import translate_markdown lazily; fall back to a passthrough with a
-    warning if src/translator.py isn't implemented yet."""
+    warning if src.translator can't be imported (e.g. a missing optional
+    dependency), so the parse step still yields output."""
     try:
         from src.translator import translate_markdown
 
