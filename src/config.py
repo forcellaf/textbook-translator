@@ -38,18 +38,15 @@ for _var in ("HTTP_PROXY", "HTTPS_PROXY", "HF_ENDPOINT"):
     if _value:
         os.environ[_var] = _value
 
-# ── Secrets / validation ────────────────────────────────────────────────────
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# Keys are read here but NOT validated here; see "Provider credentials" below,
+# which validates only the key belonging to the active LLM_PROVIDER.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY is missing. Create a `.env` file in the project root "
-        "(copy from `.env.example`) and set GEMINI_API_KEY=<your-key>."
-    )
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
 # ── Settings ─────────────────────────────────────────────────────────────
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek")
 SOURCE_LANG: str = os.getenv("SOURCE_LANG", "Chinese")
 TARGET_LANG: str = os.getenv("TARGET_LANG", "English")
 MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "3000"))
@@ -60,10 +57,9 @@ MAX_HEAL_ATTEMPTS: int = int(os.getenv("MAX_HEAL_ATTEMPTS", "3"))
 # `MINERU_MODE` selects the default parsing backend for `src.parser.parse_pdf`:
 #   "cloud" (default) - MinerU Cloud API (v4), fast, no local GPU/CPU cost.
 #   "local"           - local `magic_pdf` library (kept for future CUDA use).
-# Neither MINERU_API_KEY nor DEEPSEEK_API_KEY are validated here (unlike
-# GEMINI_API_KEY above) because not every invocation needs them (e.g. running
-# only the local parser, or only the translator). Each client validates its
-# own required key lazily, at construction time.
+# MINERU_API_KEY is not validated here because not every invocation needs it
+# (e.g. running only the local parser, or only the translator). The MinerU
+# client validates it lazily, at construction time.
 MINERU_MODE: str = os.getenv("MINERU_MODE", "cloud").lower()
 MINERU_API_KEY: str | None = os.getenv("MINERU_API_KEY")
 MINERU_API_BASE: str = os.getenv("MINERU_API_BASE", "https://mineru.net/api/v4").rstrip("/")
@@ -80,7 +76,25 @@ MINERU_UPLOAD_TIMEOUT_SECONDS: float = float(os.getenv("MINERU_UPLOAD_TIMEOUT_SE
 # ── DeepSeek (translation) ──────────────────────────────────────────────────
 DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+
+# ── Provider credentials ────────────────────────────────────────────────────
+# Only the active provider's key is required. Validating every key would block
+# a DeepSeek-only user (the common case now) on a missing Gemini key they will
+# never use; validating none would defer a missing key to a confusing SDK error
+# mid-run. Providers not listed here are rejected by `src.llm.factory.get_llm`.
+_PROVIDER_KEYS: dict[str, str | None] = {
+    "gemini": GEMINI_API_KEY,
+    "deepseek": DEEPSEEK_API_KEY,
+}
+
+_active_key_name = f"{LLM_PROVIDER.upper()}_API_KEY"
+if LLM_PROVIDER in _PROVIDER_KEYS and not _PROVIDER_KEYS[LLM_PROVIDER]:
+    raise ValueError(
+        f"{_active_key_name} is missing but LLM_PROVIDER={LLM_PROVIDER!r}. Create a "
+        f"`.env` file in the project root (copy from `.env.example`) and set "
+        f"{_active_key_name}=<your-key>."
+    )
 
 # ── PDF splitting (src.splitter / src.merger / src.chapter_splitter) ───────
 # MinerU's Precision Extract API hard-limits uploads to <= 200 pages and

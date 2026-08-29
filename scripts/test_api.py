@@ -66,6 +66,52 @@ def _has_cjk(text: str) -> bool:
     return any("一" <= char <= "鿿" for char in text)
 
 
+# ── Provider-specific remediation ───────────────────────────────────────────
+# Stages 1-2 are the ones that fail because of credentials, so their hints name
+# the env vars and the console of whichever provider is actually configured.
+
+_PROVIDER_HINTS = {
+    "deepseek": {
+        "key": "DEEPSEEK_API_KEY",
+        "model": "DEEPSEEK_MODEL",
+        "console": "https://platform.deepseek.com/api_keys",
+        "fatal": (
+            "This failure is not retryable. Check that DEEPSEEK_API_KEY is valid "
+            "(https://platform.deepseek.com/api_keys), that the account still has credit "
+            "(https://platform.deepseek.com/top_up -- a 402 means the balance is empty), "
+            "and that DEEPSEEK_MODEL names a model your key can access."
+        ),
+    },
+    "gemini": {
+        "key": "GEMINI_API_KEY",
+        "model": "GEMINI_MODEL",
+        "console": "https://aistudio.google.com/apikey",
+        "fatal": (
+            "This failure is not retryable. Check that GEMINI_API_KEY is valid and not "
+            "expired (https://aistudio.google.com/apikey) and that GEMINI_MODEL names a "
+            "model your key can access."
+        ),
+    },
+}
+
+_UNKNOWN_PROVIDER_HINT = {
+    "key": "<PROVIDER>_API_KEY",
+    "model": "<PROVIDER>_MODEL",
+    "console": "your provider's console",
+    "fatal": "This failure is not retryable; check the provider's credentials and model name.",
+}
+
+
+def _hints(provider: str) -> dict[str, str]:
+    return _PROVIDER_HINTS.get(provider, _UNKNOWN_PROVIDER_HINT)
+
+
+def _active_model(config: object) -> str:
+    """The model constant belonging to the active provider."""
+    provider = getattr(config, "LLM_PROVIDER", "")
+    return str(getattr(config, f"{provider.upper()}_MODEL", "<unknown>"))
+
+
 # ── Stages ──────────────────────────────────────────────────────────────────
 
 
@@ -77,7 +123,8 @@ def stage_1_config() -> object:
     except ValueError as exc:  # config.py raises this for a missing key
         raise StageFailure(
             f"Configuration failed to load: {exc}",
-            "Copy .env.example to .env in the project root and set GEMINI_API_KEY=<your-key>.",
+            "Copy .env.example to .env in the project root and set the API key named above "
+            "-- only the key for the provider in LLM_PROVIDER is required.",
         ) from exc
     except ImportError as exc:
         raise StageFailure(
@@ -93,13 +140,17 @@ def stage_1_config() -> object:
             f"Check LLM_PROVIDER (currently {config.LLM_PROVIDER!r}) in your .env.",
         ) from exc
 
-    print(f"    provider={config.LLM_PROVIDER} model={config.GEMINI_MODEL}")
+    print(f"    provider={config.LLM_PROVIDER} model={_active_model(config)}")
     print(f"    source_lang={config.SOURCE_LANG} target_lang={config.TARGET_LANG}")
     return llm
 
 
 def stage_2_raw_call(llm: object) -> None:
     """One raw generate() call -- the cheapest possible proof the key works."""
+    from src import config
+
+    hints = _hints(config.LLM_PROVIDER)
+
     try:
         reply = llm.generate(  # type: ignore[attr-defined]
             "You are a translation assistant. Reply with the requested text and nothing else.",
@@ -107,16 +158,24 @@ def stage_2_raw_call(llm: object) -> None:
             0.0,
         )
     except RuntimeError as exc:
+        # Retryable in production (translator.py backs off and re-tries); here
+        # it still means the one call this script makes did not come back.
         raise StageFailure(
             f"The API call failed: {exc}",
-            "Check that GEMINI_API_KEY is valid and not expired, that GEMINI_MODEL names a "
-            "model your key can access, and that the network (or HTTPS_PROXY) can reach the API.",
+            f"Check that {hints['key']} is valid ({hints['console']}), that {hints['model']} "
+            "names a model your key can access, and that the network (or HTTPS_PROXY) can "
+            "reach the API.",
         ) from exc
+    except ValueError as exc:
+        # Providers raise non-RuntimeError for failures no amount of retrying
+        # fixes -- a bad key, an empty balance, a rejected request.
+        raise StageFailure(f"The API call failed permanently: {exc}", hints["fatal"]) from exc
 
     if not reply.strip():
         raise StageFailure(
             "The API returned an empty response.",
-            "Try a different GEMINI_MODEL; the current one may be refusing or rate-limiting.",
+            f"Try a different {hints['model']}; the current one may be refusing or "
+            "rate-limiting.",
         )
     print(f"    response: {reply.strip()[:80]}")
 
