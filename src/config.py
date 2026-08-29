@@ -53,6 +53,17 @@ MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "3000"))
 API_MAX_RETRIES: int = int(os.getenv("API_MAX_RETRIES", "5"))
 MAX_HEAL_ATTEMPTS: int = int(os.getenv("MAX_HEAL_ATTEMPTS", "3"))
 
+# Fraction of a chunk's non-math characters that may still be written in the
+# source script before the output is treated as untranslated and re-asked.
+# Calibrated against a real run: the source Markdown of the physics textbook is
+# ~35% CJK by character, a chunk the model passed through verbatim measured
+# ~30%, and a genuinely translated chunk measures ~0% -- the handful of
+# characters a legitimate proper noun or a "leave as-is" glossary term
+# contributes stays under 1% of a 2000-character chunk. 4% sits an order of
+# magnitude below the failure signal and several times above the legitimate
+# ceiling. Raise it for a book that deliberately keeps source-script terms.
+SOURCE_RESIDUE_THRESHOLD: float = float(os.getenv("SOURCE_RESIDUE_THRESHOLD", "0.04"))
+
 # ── MinerU (PDF -> Markdown) ────────────────────────────────────────────────
 # `MINERU_MODE` selects the default parsing backend for `src.parser.parse_pdf`:
 #   "cloud" (default) - MinerU Cloud API (v4), fast, no local GPU/CPU cost.

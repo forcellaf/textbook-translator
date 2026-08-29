@@ -18,9 +18,10 @@ The two resilience layers, and why they must not compound
    single ``llm.generate`` call by tenacity, with exponential backoff. When
    that whole schedule is exhausted, the failure is permanent as far as this
    module is concerned and ``TranslationError`` propagates immediately.
-2. *Successful but bad* output (empty, implausibly short, structurally
-   invalid LaTeX) is re-asked up to ``MAX_HEAL_ATTEMPTS`` times, quoting the
-   specific problem back to the model.
+2. *Successful but bad* output (empty, implausibly short, still in the source
+   language, structurally invalid LaTeX) is re-asked up to
+   ``MAX_HEAL_ATTEMPTS`` times, quoting the specific problem back to the
+   model.
 
 These are nested the only way round that works: the heal loop never catches
 ``TranslationError``. If it did, a dead API key would cost
@@ -49,6 +50,7 @@ from src.config import (
     MAX_CHUNK_TOKENS,
     MAX_HEAL_ATTEMPTS,
     SOURCE_LANG,
+    SOURCE_RESIDUE_THRESHOLD,
     TARGET_LANG,
 )
 from src.latex import assemble_document, validate_fragment
@@ -79,6 +81,11 @@ CHARS_PER_TOKEN = 1.5
 # English).
 _MIN_LENGTH_RATIO = 0.30
 _SHORT_SOURCE_FLOOR = 200
+
+# Floor for the source-residue check. Below this many non-whitespace
+# characters a percentage is noise: one legitimately kept proper noun in a
+# two-line chunk is already well past any sane threshold.
+_MIN_RESIDUE_SAMPLE = 80
 
 # Backoff schedule for transient API failures: ~1+2+4+8s across the default
 # five attempts. Module-level so tests can neutralize the sleeps.
@@ -244,7 +251,145 @@ def _strip_wrapping_fence(text: str) -> str:
     return match.group(1).strip() if match else text.strip()
 
 
-def _diagnose(source: str, output: str, output_format: str) -> str | None:
+# ── Source-language residue ─────────────────────────────────────────────────
+#
+# A chunk can come back full-length and structurally perfect while still being
+# the untranslated source: the model does the Markdown-to-LaTeX conversion and
+# silently skips the translation half of the job, sometimes emitting a heading
+# twice (once per language) before continuing in the source language. The
+# length heuristic sees a full-length answer and the LaTeX validator sees
+# well-formed \section{} blocks, so measuring how much source-only script
+# survives is the only thing that catches it.
+
+_SCRIPT_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
+    "han": ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0x20000, 0x2A6DF)),
+    "kana": ((0x3040, 0x30FF), (0x31F0, 0x31FF)),
+    "hangul": ((0x1100, 0x11FF), (0x3130, 0x318F), (0xAC00, 0xD7AF)),
+    "latin": ((0x41, 0x5A), (0x61, 0x7A), (0xC0, 0x24F), (0x1E00, 0x1EFF)),
+    "cyrillic": ((0x400, 0x52F),),
+    "greek": ((0x370, 0x3FF), (0x1F00, 0x1FFF)),
+    "arabic": ((0x600, 0x6FF), (0x750, 0x77F)),
+    "hebrew": ((0x590, 0x5FF),),
+    "devanagari": ((0x900, 0x97F),),
+    "thai": ((0xE00, 0xE7F),),
+}
+
+# Which scripts each language is written in. This exists to answer exactly one
+# question -- does the source use a script the target does not? -- so a
+# language absent from this map disables the check instead of guessing. A
+# wrong guess bills an extra API call on every chunk of the book.
+#
+# Han is listed for Japanese and Korean deliberately: both legitimately contain
+# Han characters, so Chinese -> Japanese leaves nothing source-exclusive and
+# the check correctly turns itself off rather than flagging valid output.
+_LANGUAGE_SCRIPTS: dict[str, frozenset[str]] = {
+    "chinese": frozenset({"han"}),
+    "simplified chinese": frozenset({"han"}),
+    "traditional chinese": frozenset({"han"}),
+    "mandarin": frozenset({"han"}),
+    "zh": frozenset({"han"}),
+    "japanese": frozenset({"han", "kana"}),
+    "ja": frozenset({"han", "kana"}),
+    "korean": frozenset({"hangul", "han"}),
+    "ko": frozenset({"hangul", "han"}),
+    "english": frozenset({"latin"}),
+    "en": frozenset({"latin"}),
+    "french": frozenset({"latin"}),
+    "fr": frozenset({"latin"}),
+    "german": frozenset({"latin"}),
+    "de": frozenset({"latin"}),
+    "spanish": frozenset({"latin"}),
+    "es": frozenset({"latin"}),
+    "italian": frozenset({"latin"}),
+    "portuguese": frozenset({"latin"}),
+    "dutch": frozenset({"latin"}),
+    "polish": frozenset({"latin"}),
+    "turkish": frozenset({"latin"}),
+    "vietnamese": frozenset({"latin"}),
+    "indonesian": frozenset({"latin"}),
+    "malay": frozenset({"latin"}),
+    "russian": frozenset({"cyrillic"}),
+    "ru": frozenset({"cyrillic"}),
+    "ukrainian": frozenset({"cyrillic"}),
+    "greek": frozenset({"greek"}),
+    "arabic": frozenset({"arabic"}),
+    "persian": frozenset({"arabic"}),
+    "farsi": frozenset({"arabic"}),
+    "hebrew": frozenset({"hebrew"}),
+    "hindi": frozenset({"devanagari"}),
+    "thai": frozenset({"thai"}),
+}
+
+# Regions that must not count towards residue: a formula with a CJK subscript
+# and an image path with a CJK filename are both correct output. Ordered
+# longest-delimiter-first so $$...$$ is consumed before the inline $...$ rule
+# can bite into it.
+_NON_PROSE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\$\$.*?\$\$", re.DOTALL),
+    re.compile(r"\\\[.*?\\\]", re.DOTALL),
+    re.compile(
+        r"\\begin\{(equation|align|gather|multline|eqnarray|displaymath|math)\*?\}"
+        r".*?\\end\{\1\*?\}",
+        re.DOTALL,
+    ),
+    re.compile(r"(?<!\\)\$.*?(?<!\\)\$", re.DOTALL),
+    re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{[^}]*\}"),
+)
+
+# ![alt](path) -> ![alt]: the path is not prose, the alt text is and must be
+# translated like any other caption.
+_MARKDOWN_IMAGE_PATH_RE = re.compile(r"(!\[[^\]]*\])\([^)]*\)")
+
+
+def _script_of(char: str) -> str | None:
+    """Name of the script ``char`` belongs to, or None if it is in none of
+    the tracked ranges (digits, punctuation, symbols)."""
+    code = ord(char)
+    for script, ranges in _SCRIPT_RANGES.items():
+        if any(low <= code <= high for low, high in ranges):
+            return script
+    return None
+
+
+def _strip_non_prose(text: str) -> str:
+    """Remove math and image paths, leaving the text that had to be translated."""
+    for pattern in _NON_PROSE_PATTERNS:
+        text = pattern.sub(" ", text)
+    return _MARKDOWN_IMAGE_PATH_RE.sub(r"\1", text)
+
+
+def _source_residue(output: str, source_lang: str, target_lang: str) -> float | None:
+    """Fraction of ``output``'s prose still written in a source-only script.
+
+    Returns None when the check does not apply: when either language's script
+    is unknown, when the source uses no script the target lacks (English ->
+    French, Chinese -> Japanese), or when there is too little text to measure.
+    """
+    source_scripts = _LANGUAGE_SCRIPTS.get(source_lang.strip().lower())
+    target_scripts = _LANGUAGE_SCRIPTS.get(target_lang.strip().lower())
+    if source_scripts is None or target_scripts is None:
+        return None
+
+    source_only = source_scripts - target_scripts
+    if not source_only:
+        return None
+
+    prose = [char for char in _strip_non_prose(output) if not char.isspace()]
+    if len(prose) < _MIN_RESIDUE_SAMPLE:
+        return None
+
+    residue = sum(1 for char in prose if _script_of(char) in source_only)
+    return residue / len(prose)
+
+
+def _diagnose(
+    source: str,
+    output: str,
+    output_format: str,
+    *,
+    source_lang: str = SOURCE_LANG,
+    target_lang: str = TARGET_LANG,
+) -> str | None:
     """Return a human-readable description of what's wrong with ``output``,
     or None if it looks usable."""
     stripped = output.strip()
@@ -256,6 +401,10 @@ def _diagnose(source: str, output: str, output_format: str) -> str | None:
             f"output was empty or implausibly short ({len(stripped)} chars "
             f"for {len(source)} chars of input)"
         )
+
+    residue = _source_residue(stripped, source_lang, target_lang)
+    if residue is not None and residue > SOURCE_RESIDUE_THRESHOLD:
+        return f"output is still {residue:.0%} {source_lang} - the text was not translated"
 
     if output_format == "latex":
         issues = validate_fragment(stripped)
@@ -315,7 +464,9 @@ def translate_chunk(
     # Layer 1 (transient failures) happens inside this call; a permanent
     # failure raises TranslationError here and never reaches the heal loop.
     result = _strip_wrapping_fence(_generate_with_retry(llm, system_prompt, chunk))
-    problem = _diagnose(chunk, result, output_format)
+    problem = _diagnose(
+        chunk, result, output_format, source_lang=source_lang, target_lang=target_lang
+    )
 
     # Layer 2: the API is answering, the answer is just unusable.
     for attempt in range(1, MAX_HEAL_ATTEMPTS + 1):
@@ -330,7 +481,9 @@ def translate_chunk(
         result = _strip_wrapping_fence(
             _generate_with_retry(llm, _heal_prompt(system_prompt, problem), chunk)
         )
-        problem = _diagnose(chunk, result, output_format)
+        problem = _diagnose(
+            chunk, result, output_format, source_lang=source_lang, target_lang=target_lang
+        )
 
     if problem is not None:
         # Returning imperfect text beats aborting a multi-hour book run over

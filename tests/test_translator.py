@@ -63,6 +63,16 @@ def _long_text(label: str, repeats: int = 30) -> str:
     return (f"{label} sentence about the subject matter. " * repeats).strip()
 
 
+def _long_chinese(repeats: int = 8) -> str:
+    """Source-language text long enough to clear the length heuristic.
+
+    Every fixture below has to be long on both sides: a short answer trips
+    "empty or implausibly short" first and the residue check is never reached,
+    which would pass these tests for the wrong reason.
+    """
+    return "静电场的电场强度由库仑定律给出，其方向沿电荷连线方向。" * repeats
+
+
 # ── chunk_markdown ──────────────────────────────────────────────────────────
 
 
@@ -189,6 +199,137 @@ def test_wrapping_code_fence_is_stripped() -> None:
     llm = FakeLLM([f"```markdown\n{body}\n```"])
 
     assert translate_chunk(_long_text("source"), llm=llm) == body
+
+
+# ── translate_chunk: source-language residue ────────────────────────────────
+
+
+def test_untranslated_output_triggers_heal_naming_the_residue() -> None:
+    """Regression: a full-length, well-formed answer that is still Chinese.
+
+    Neither the length heuristic nor the LaTeX validator sees anything wrong
+    with the model echoing its input, so only the residue check catches it.
+    """
+    source = _long_chinese()
+    untranslated = _long_chinese()
+    good = _long_text("The electrostatic field", repeats=8)
+    llm = FakeLLM([untranslated, good])
+
+    result = translate_chunk(source, llm=llm)
+
+    assert result == good
+    assert llm.call_count == 2
+    assert "% Chinese - the text was not translated" in llm.calls[1][0]
+
+
+def test_heading_emitted_in_both_languages_triggers_heal() -> None:
+    """The exact symptom from the real run: heading translated, then repeated
+    untranslated with the rest of the chunk following it in Chinese."""
+    half_done = (
+        "\\section{Electric Field and Electric Field Strength}\n"
+        "\\section{电场 电场强度}\n" + _long_chinese()
+    )
+    good = "\\section{Electric Field}\n" + _long_text("The field", repeats=8)
+    llm = FakeLLM([half_done, good])
+
+    result = translate_chunk(_long_chinese(), llm=llm, output_format="latex")
+
+    assert result == good
+    heal_prompt = llm.calls[1][0]
+    assert "the text was not translated" in heal_prompt
+    # The fragment is structurally valid LaTeX; residue is the actual defect.
+    assert "invalid LaTeX" not in heal_prompt
+
+
+def test_properly_translated_output_does_not_trigger_heal() -> None:
+    translated = _long_text("The electrostatic field", repeats=8)
+    llm = FakeLLM([translated])
+
+    assert translate_chunk(_long_chinese(), llm=llm) == translated
+    assert llm.call_count == 1
+
+
+def test_cjk_inside_math_does_not_trigger_heal() -> None:
+    """Math is excluded before measuring: a CJK subscript is legitimate.
+
+    The 26 CJK characters here would be ~11% of the answer -- comfortably over
+    the threshold -- if the math were counted.
+    """
+    translated = (
+        _long_text("The charge density follows", repeats=4)
+        + "\n\n$$\\rho_{"
+        + "电荷" * 12
+        + "} = 0$$\n\n"
+        + "and $E_{电场}$ is the field strength."
+    )
+    llm = FakeLLM([translated])
+
+    assert translate_chunk(_long_chinese(), llm=llm) == translated
+    assert llm.call_count == 1
+
+
+def test_image_path_is_not_counted_as_residue() -> None:
+    translated = (
+        _long_text("The apparatus is shown below", repeats=4)
+        + "\n\n![The electrostatic apparatus](images/静电场装置图.jpg)"
+    )
+    llm = FakeLLM([translated])
+
+    assert translate_chunk(_long_chinese(), llm=llm) == translated
+    assert llm.call_count == 1
+
+
+def test_residue_below_the_threshold_does_not_trigger_heal() -> None:
+    """A proper noun kept in the source script is not a failed translation."""
+    translated = _long_text("The Beijing observatory", repeats=8) + " (北京台)"
+    llm = FakeLLM([translated])
+
+    assert translate_chunk(_long_chinese(), llm=llm) == translated
+    assert llm.call_count == 1
+
+
+def test_residue_check_is_skipped_for_a_same_script_language_pair() -> None:
+    """English -> French: script says nothing, so the check must not run.
+
+    The answer here is the source verbatim and still must not cost a retry --
+    a false positive would bill one extra call on every chunk of the book.
+    """
+    source = _long_text("source")
+    llm = FakeLLM([source])
+
+    result = translate_chunk(source, llm=llm, source_lang="English", target_lang="French")
+
+    assert result == source
+    assert llm.call_count == 1
+
+
+def test_residue_check_is_skipped_when_the_target_shares_the_script() -> None:
+    """Chinese -> Japanese: Han in the output is expected, not a defect."""
+    chinese = _long_chinese()
+    llm = FakeLLM([chinese])
+
+    assert translate_chunk(chinese, llm=llm, target_lang="Japanese") == chinese
+    assert llm.call_count == 1
+
+
+def test_residue_check_is_skipped_for_an_unknown_language() -> None:
+    chinese = _long_chinese()
+    llm = FakeLLM([chinese])
+
+    assert translate_chunk(chinese, llm=llm, target_lang="Klingon") == chinese
+    assert llm.call_count == 1
+
+
+def test_untranslated_output_returns_last_response_after_heals_exhausted(caplog) -> None:
+    untranslated = _long_chinese()
+    llm = FakeLLM([untranslated])
+
+    with caplog.at_level("ERROR"):
+        result = translate_chunk(_long_chinese(), llm=llm)
+
+    assert result == untranslated
+    assert llm.call_count == MAX_HEAL_ATTEMPTS + 1
+    assert any("Giving up healing" in record.message for record in caplog.records)
 
 
 # ── translate_chunk: transient failures ─────────────────────────────────────
