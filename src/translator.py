@@ -175,6 +175,16 @@ Rules:
   output, and do not add content that is not in the source."""
 
 _LATEX_RULES = """\
+
+Your PRIMARY task is translation. Converting Markdown to LaTeX is secondary.
+A structurally perfect LaTeX document that is still in the source language is
+a FAILED answer.
+
+- Translate ALL prose: chapter and section titles, body paragraphs, figure
+  captions, table cells, exercise text, footnotes.
+- The ONLY things that keep their original form are mathematics and image
+  paths. Everything else must be in the target language.
+
 Output LaTeX body content only.
 
 Hard constraints -- the preamble is generated separately and yours would
