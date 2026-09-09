@@ -1,0 +1,16 @@
+% Cap figure size. MinerU's extracted images carry no intrinsic size that
+% LaTeX can use sensibly, so without this every figure renders at its natural
+% pixel dimensions -- usually far wider than the text block.
+\setkeys{Gin}{width=0.55\linewidth,keepaspectratio}
+
+% Keep figures near the text that refers to them rather than drifting to the
+% end of the chapter.
+\renewcommand{\topfraction}{0.85}
+\renewcommand{\bottomfraction}{0.7}
+\renewcommand{\textfraction}{0.15}
+\renewcommand{\floatpagefraction}{0.7}
+
+% Tighter chapter openings than the book class default.
+\usepackage{titlesec}
+\titleformat{\chapter}[display]{\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{10pt}{\Large}
+\titlespacing*{\chapter}{0pt}{-20pt}{20pt}
