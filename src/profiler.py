@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from src.config import SOURCE_LANG, TARGET_LANG
@@ -43,6 +44,10 @@ _SLICE_COUNT = 5
 _SAMPLE_BUDGET = _HEAD_CHARS + _SLICE_CHARS * _SLICE_COUNT
 
 _HEADING_RE = re.compile(r"^#{1,6}[ \t]+\S", re.MULTILINE)
+# Same shape, but per-line and with the hashes and title captured. Kept
+# identical to `src.normalize.HEADING_RE` on purpose: both modules rewrite
+# heading lines, and a divergence between them would silently drop headings.
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})[ \t]+(.*\S)[ \t]*$")
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*|\s*```\s*$")
 
 _GLOSSARY_MIN = 15
@@ -69,11 +74,21 @@ class BookProfile:
     latex_documentclass: str = "book"
     latex_packages: tuple[str, ...] = ()
     summary: str = ""
+    # Heading text -> heading level, from the classification call below. Empty
+    # means "unclassified", which `apply_heading_levels` treats as "change
+    # nothing".
+    heading_levels: tuple[tuple[str, int], ...] = ()
+    # Lines the parser marked as headings that are really body text.
+    non_headings: tuple[str, ...] = ()
 
     @classmethod
     def generic(cls) -> "BookProfile":
         """The fallback profile: all defaults, no glossary, no assumptions."""
         return cls()
+
+    @property
+    def heading_level_map(self) -> dict[str, int]:
+        return dict(self.heading_levels)
 
     def to_json(self) -> str:
         return json.dumps(
@@ -89,6 +104,10 @@ class BookProfile:
                 "latex_documentclass": self.latex_documentclass,
                 "latex_packages": list(self.latex_packages),
                 "summary": self.summary,
+                # Written last, and as a plain object, so a human can open
+                # book_profile.json and fix one heading level by hand.
+                "heading_levels": {text: level for text, level in self.heading_levels},
+                "non_headings": list(self.non_headings),
             },
             indent=2,
             ensure_ascii=False,
@@ -121,6 +140,8 @@ class BookProfile:
             ),
             latex_packages=_as_str_tuple(data.get("latex_packages")),
             summary=_as_str(data, "summary", defaults.summary),
+            heading_levels=_as_heading_levels(data.get("heading_levels")),
+            non_headings=_as_str_tuple(data.get("non_headings")),
         )
 
 
@@ -168,6 +189,46 @@ def _as_glossary(value: object) -> tuple[tuple[str, str], ...]:
             entries.append(pair)
         else:
             logger.debug("Skipping malformed glossary entry: %r", item)
+
+    return tuple(entries)
+
+
+def _as_heading_levels(value: object) -> tuple[tuple[str, int], ...]:
+    """Coerce the heading classification, tolerating LLM sloppiness.
+
+    Accepts ``{"12.1 电荷": 2}``, ``[{"heading": ..., "level": ...}]`` and
+    ``[["12.1 电荷", 2]]``. Levels outside 1-6 (or unparseable) are dropped
+    rather than clamped: a heading we cannot read a level for is one we leave
+    exactly as the parser wrote it.
+    """
+    items: list[tuple[object, object]]
+    if isinstance(value, dict):
+        items = list(value.items())
+    elif isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if isinstance(item, dict):
+                items.append((item.get("heading"), item.get("level")))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                items.append((item[0], item[1]))
+            else:
+                logger.debug("Skipping malformed heading entry: %r", item)
+    else:
+        return ()
+
+    entries: list[tuple[str, int]] = []
+    for text, level in items:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        try:
+            parsed = int(level)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logger.debug("Skipping heading %r with unreadable level %r", text, level)
+            continue
+        if 1 <= parsed <= 6:
+            entries.append((text.strip(), parsed))
+        else:
+            logger.debug("Skipping heading %r with out-of-range level %d", text, parsed)
 
     return tuple(entries)
 
@@ -268,6 +329,167 @@ def profile_to_prompt_block(profile: BookProfile, *, max_glossary: int = 40) -> 
     return "\n".join(lines)
 
 
+# ── Heading classification ──────────────────────────────────────────────────
+#
+# The cloud parser gets levels 1 and 2 right but flattens everything below:
+# on the test book, 20 headings at `#`, 422 at `##`, none deeper. Sections
+# (`## 12.1 电荷`), subsections (`## 1. 电荷的种类`) and worked examples
+# (`## 例12.3`) all land at `##`, so pandoc renders them at identical weight
+# and the outline is wrong.
+#
+# This cannot be a fixed regex: heading conventions vary between books, which
+# is exactly the kind of per-book judgement the profiler already exists to
+# make. The cost is small -- the full heading list for a 500-page book is
+# about 4,000 characters, roughly 1,000 tokens, 0.5% of the book -- so it
+# goes up in a single call alongside the profile, and is cached in the same
+# hand-editable book_profile.json.
+
+
+def extract_headings(text: str) -> list[str]:
+    """Every distinct heading string in ``text``, in first-appearance order.
+
+    Deduplicated because a textbook repeats ``提要`` and ``习题`` once per
+    chapter, and sending 19 copies of each buys nothing.
+    """
+    seen: dict[str, None] = {}
+    for line in text.split("\n"):
+        match = _HEADING_LINE_RE.match(line)
+        if match:
+            seen.setdefault(match.group(2), None)
+    return list(seen)
+
+
+def _build_heading_prompt(source_lang: str) -> str:
+    return (
+        f"You are analyzing the heading structure of a {source_lang} textbook. "
+        "Below is every distinct heading the PDF parser produced, one per line, "
+        "in document order. The parser got the top two levels roughly right but "
+        "flattened everything below them, so parts, chapters, sections, "
+        "subsections and worked examples are all mixed together.\n\n"
+        "Assign each heading its true outline level:\n"
+        "  1 = part or chapter (the largest division)\n"
+        "  2 = section within a chapter\n"
+        "  3 = subsection\n"
+        "  4 = worked example, or a smaller division inside a subsection\n\n"
+        "Judge from the book's own conventions -- numbering style, recurring "
+        "wording, ordering -- not from a fixed rule. Recurring end-of-chapter "
+        "blocks (summary, exercises, problems) are siblings of the sections "
+        "they follow.\n\n"
+        "Return ONLY a single JSON object -- no prose, no code fences -- with "
+        "exactly these keys:\n"
+        '  "heading_levels": an object mapping each heading string EXACTLY as '
+        "given to its integer level 1-4. Include every heading.\n"
+        '  "non_headings": a list of the given strings that are not headings at '
+        "all, but body text the parser mis-tagged. Use this sparingly; when in "
+        "doubt, leave a heading in heading_levels.\n"
+        '  "fragments": a list of the given strings that look like a piece of a '
+        "heading torn in half rather than a whole heading. Report only; do not "
+        "join them yourself.\n\n"
+        "Copy each heading string byte for byte, including its numbering and "
+        "punctuation. A string that does not match will be ignored, leaving "
+        "that heading at whatever level the parser guessed."
+    )
+
+
+def classify_headings(
+    text: str,
+    llm: BaseLLM,
+    *,
+    source_lang: str = SOURCE_LANG,
+) -> tuple[tuple[tuple[str, int], ...], tuple[str, ...]]:
+    """Ask the LLM for a level per heading.
+
+    Returns ``(heading_levels, non_headings)``. Follows the module's failure
+    policy: any LLM or parse failure logs a warning and returns empty tuples,
+    which ``apply_heading_levels`` reads as "leave every heading alone".
+    """
+    headings = extract_headings(text)
+    if not headings:
+        logger.warning("No headings found; skipping heading classification")
+        return (), ()
+
+    try:
+        raw = llm.generate(
+            _build_heading_prompt(source_lang), "\n".join(headings), temperature=0.0
+        )
+        parsed = _extract_json_object(raw)
+    except Exception as exc:  # noqa: BLE001 - classification must never be fatal
+        logger.warning(
+            "Heading classification failed (%s); leaving heading levels as the "
+            "parser produced them.",
+            exc,
+        )
+        return (), ()
+
+    known = set(headings)
+    levels = tuple(
+        (heading, level)
+        for heading, level in _as_heading_levels(parsed.get("heading_levels"))
+        if heading in known
+    )
+    non_headings = tuple(h for h in _as_str_tuple(parsed.get("non_headings")) if h in known)
+
+    fragments = tuple(h for h in _as_str_tuple(parsed.get("fragments")) if h in known)
+    if fragments:
+        logger.warning(
+            "Heading classification flagged %d possible fragment(s), left "
+            "unchanged for review: %s",
+            len(fragments),
+            ", ".join(fragments[:10]),
+        )
+
+    missing = len(known) - len(levels) - len(non_headings)
+    if missing > 0:
+        logger.warning(
+            "%d of %d heading(s) came back unclassified and keep their parsed level",
+            missing,
+            len(known),
+        )
+
+    return levels, non_headings
+
+
+def apply_heading_levels(text: str, profile: BookProfile) -> tuple[str, Counter[str]]:
+    """Rewrite heading levels in ``text`` according to ``profile``.
+
+    Pure and LLM-free, so the interesting behaviour is testable without a
+    provider. A heading the profile says nothing about keeps the level the
+    parser gave it -- an unclassified heading is never guessed at.
+
+    Returns ``(new_text, counts)`` where ``counts`` tallies ``relevelled``,
+    ``unchanged`` and ``demoted`` (mis-tagged body text turned back into a
+    paragraph).
+    """
+    levels = profile.heading_level_map
+    non_headings = set(profile.non_headings)
+    counts: Counter[str] = Counter()
+
+    out: list[str] = []
+    for line in text.split("\n"):
+        match = _HEADING_LINE_RE.match(line)
+        if not match:
+            out.append(line)
+            continue
+
+        hashes, title = match.group(1), match.group(2)
+
+        if title in non_headings:
+            out.append(title)
+            counts["demoted"] += 1
+            continue
+
+        level = levels.get(title)
+        if level is None or level == len(hashes):
+            out.append(line)
+            counts["unchanged"] += 1
+            continue
+
+        out.append("#" * level + " " + title)
+        counts["relevelled"] += 1
+
+    return "\n".join(out), counts
+
+
 # ── Response parsing ────────────────────────────────────────────────────────
 
 
@@ -309,8 +531,19 @@ def profile_book(
     source_lang: str = SOURCE_LANG,
     target_lang: str = TARGET_LANG,
     force: bool = False,
+    with_headings: bool = True,
 ) -> BookProfile:
     """Profile the book at ``merged_md_path``, caching to ``work_dir``.
+
+    Makes up to two LLM calls: one to characterize the book, one to classify
+    its heading levels (see ``classify_headings``). Both are cached together
+    in ``work_dir/book_profile.json``, which is meant to be opened and
+    hand-corrected.
+
+    Pass ``merged_md_path`` the **normalized** markdown, not the raw parser
+    output: heading strings are matched literally, so classifying
+    ``## 第13章`` and then merging it into ``## 第13章 电势`` would leave the
+    classification unusable.
 
     Args:
         merged_md_path: The book's merged Markdown.
@@ -320,6 +553,8 @@ def profile_book(
         source_lang: Language the book is written in.
         target_lang: Language it will be translated into.
         force: Re-profile even when a cached profile exists.
+        with_headings: Also classify heading levels. Turn off to skip the
+            second call.
 
     Returns:
         The parsed ``BookProfile``, or ``BookProfile.generic()`` if anything
@@ -349,6 +584,12 @@ def profile_book(
             temperature=0.2,
         )
         profile = BookProfile.from_dict(_extract_json_object(raw))
+        if with_headings:
+            # Isolated from the profile call above: `classify_headings` never
+            # raises, so a heading failure costs the heading levels only, not
+            # the glossary that took a full book read to produce.
+            levels, non_headings = classify_headings(text, llm, source_lang=source_lang)
+            profile = replace(profile, heading_levels=levels, non_headings=non_headings)
     except Exception as exc:  # noqa: BLE001 - profiling must never be fatal
         logger.warning(
             "Book profiling failed (%s); falling back to a generic profile. "
@@ -365,11 +606,12 @@ def profile_book(
         logger.warning("Could not cache book profile to %s: %s", cache_path, exc)
 
     logger.info(
-        "Profiled book as %s/%s (%s), %d glossary term(s)",
+        "Profiled book as %s/%s (%s), %d glossary term(s), %d classified heading(s)",
         profile.subject,
         profile.subfield or "-",
         profile.education_level,
         len(profile.glossary),
+        len(profile.heading_levels),
     )
     return profile
 
@@ -377,6 +619,9 @@ def profile_book(
 __all__ = [
     "PROFILE_FILENAME",
     "BookProfile",
+    "apply_heading_levels",
+    "classify_headings",
+    "extract_headings",
     "profile_book",
     "profile_to_prompt_block",
 ]

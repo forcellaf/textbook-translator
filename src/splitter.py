@@ -2,8 +2,7 @@
 Split an oversized PDF into fixed page-range chunks so each chunk fits
 MinerU's Precision Extract API limits (<= 200 pages, <= 200 MB per file).
 
-Uses PyMuPDF (imported as ``pymupdf``, bundled with ``magic-pdf[full]`` --
-no new dependency needed) for all page manipulation.
+Uses PyMuPDF (imported as ``pymupdf``) for all page manipulation.
 
 See ``split_pdf`` for the full tiling/overlap/bookmark-snapping/size-guard
 contract.

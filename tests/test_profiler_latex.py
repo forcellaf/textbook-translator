@@ -148,7 +148,10 @@ def test_profile_book_parses_and_caches(tmp_path: Path) -> None:
     profile = profile_book(merged, tmp_path, llm=llm)
 
     assert profile.subject == "mathematics"
-    assert llm.call_count == 1
+    # Two calls: one to characterize the book, one to classify its heading
+    # levels. Both are cached in the same book_profile.json. See
+    # tests/test_heading_classification.py for the second one's behaviour.
+    assert llm.call_count == 2
     assert (tmp_path / PROFILE_FILENAME).exists()
 
 
@@ -170,7 +173,8 @@ def test_force_re_profiles_despite_the_cache(tmp_path: Path) -> None:
     second_llm = FakeLLM(VALID_PROFILE_JSON)
     profile_book(merged, tmp_path, llm=second_llm, force=True)
 
-    assert second_llm.call_count == 1
+    # Both the book call and the heading-classification call are re-made.
+    assert second_llm.call_count == 2
 
 
 def test_fenced_and_prefixed_json_is_still_parsed(tmp_path: Path) -> None:

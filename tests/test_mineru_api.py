@@ -1,213 +1,384 @@
-#!/usr/bin/env python3
-"""
-Parse a PDF with the MinerU cloud API (v4 precise-parsing endpoint).
+"""Tests for src.mineru_api (split -> upload -> poll -> merge).
 
-Handles the whole flow: split -> request upload URLs -> PUT files -> poll ->
-download result zips -> merge into one markdown + one images/ folder.
-
-Usage:
-    export MINERU_TOKEN=...            # or pass --token
-    python mineru_cloud.py book.pdf -o out/
-
-Why splitting is needed
------------------------
-The API caps each file at 200 pages and 200 MB. A 516-page textbook therefore
-goes up as three files. The batch endpoint accepts up to 50 files per request,
-so all parts are submitted together and parsed in parallel.
-
-Model choice
-------------
-`vlm` is what MinerU's own docs recommend, and it produces markedly cleaner
-LaTeX than `pipeline` -- compare "10^{-20}" against pipeline's "1 0 ^ { - 2 0 }".
-The tradeoff is that VLM backends can hallucinate, which for a physics textbook
-means a plausible-looking equation with a wrong exponent that no automated check
-will catch. Parse a chapter with each and diff the formulas before committing to
-`vlm` for a whole book.
-
-Quota: 1000 pages/day at highest priority; beyond that, lower priority.
+Every HTTP call is served by an ``httpx.MockTransport``: the suite must never
+touch the network or spend a page of the daily quota.
 """
 
 from __future__ import annotations
 
-import argparse
 import io
-import os
-import shutil
-import sys
-import time
+import json
 import zipfile
 from pathlib import Path
 
-import requests
+import httpx
+import pymupdf
+import pytest
 
-API = "https://mineru.net/api/v4"
-MAX_PAGES = 200  # hard API limit per file
+from src import config
+from src.mineru_api import (
+    MinerUClient,
+    MinerUError,
+    parse_pdf,
+)
+
+BATCH_ID = "batch-abc123"
+ZIP_URL = "https://storage.example.com/results/{name}.zip"
+UPLOAD_URL = "https://oss.example.com/upload/{name}?signature=deadbeef"
 
 
-def split_pdf(pdf: Path, out_dir: Path, max_pages: int = MAX_PAGES) -> list[Path]:
-    """Split into <=max_pages parts. Returns the parts in order."""
-    import pymupdf
+# ── Fixtures ────────────────────────────────────────────────────────────────
 
-    doc = pymupdf.open(pdf)
-    total = doc.page_count
-    if total <= max_pages:
-        doc.close()
-        return [pdf]
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    parts: list[Path] = []
-    for i, start in enumerate(range(0, total, max_pages), 1):
-        end = min(start + max_pages, total) - 1
-        part = pymupdf.open()
-        part.insert_pdf(doc, from_page=start, to_page=end)
-        path = out_dir / f"{pdf.stem}_part{i:02d}.pdf"
-        part.save(path)
-        part.close()
-        parts.append(path)
-        print(f"  part {i}: pages {start + 1}-{end + 1} -> {path.name}")
+def _make_pdf(path: Path, num_pages: int) -> None:
+    doc = pymupdf.open()
+    for i in range(num_pages):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Page {i + 1}")
+    doc.save(path)
     doc.close()
-    return parts
 
 
-def submit(parts: list[Path], token: str, model: str, language: str) -> str:
-    """Request upload URLs, PUT each file, return the batch id.
+def _make_zip(markdown: str, images: dict[str, bytes] | None = None) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("full.md", markdown)
+        archive.writestr("layout.json", "{}")
+        for name, blob in (images or {}).items():
+            archive.writestr(f"images/{name}", blob)
+    return buffer.getvalue()
 
-    Uploading a file automatically submits its parse task -- there is no
-    separate submit call.
+
+class FakeAPI:
+    """Scripted MinerU. Records every request so tests can assert on headers.
+
+    ``poll_states`` is a list of per-poll state lists, so a test can script a
+    batch that reports ``running`` before it reports ``done``.
     """
-    body = {
-        "files": [{"name": p.name, "is_ocr": True} for p in parts],
-        "model_version": model,
-        "language": language,
-        "enable_formula": True,
-        "enable_table": True,
-    }
-    r = requests.post(
-        f"{API}/file-urls/batch",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-        json=body,
-        timeout=60,
-    )
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("code") != 0:
-        raise RuntimeError(f"submit failed: {payload.get('msg')} (code {payload.get('code')})")
 
-    batch_id = payload["data"]["batch_id"]
-    urls = payload["data"]["file_urls"]
-    print(f"batch {batch_id}")
+    def __init__(
+        self,
+        *,
+        markdown: dict[str, str] | None = None,
+        images: dict[str, bytes] | None = None,
+        poll_states: list[list[str]] | None = None,
+        submit_code: int = 0,
+        submit_msg: str = "ok",
+        err_msgs: dict[str, str] | None = None,
+        upload_status: int = 200,
+    ) -> None:
+        self.markdown = markdown or {}
+        self.images = images or {}
+        self.poll_states = poll_states
+        self.submit_code = submit_code
+        self.submit_msg = submit_msg
+        self.err_msgs = err_msgs or {}
+        self.upload_status = upload_status
 
-    for path, url in zip(parts, urls):
-        size_mb = path.stat().st_size / 1e6
-        print(f"  uploading {path.name} ({size_mb:.1f} MB)...", end=" ", flush=True)
-        with path.open("rb") as f:
-            # Deliberately no Content-Type header: the docs say not to set one.
-            up = requests.put(url, data=f, timeout=3600)
-        print("ok" if up.status_code in (200, 201) else f"FAILED {up.status_code}")
-        if up.status_code not in (200, 201):
-            raise RuntimeError(f"upload failed for {path.name}")
-    return batch_id
+        self.requests: list[httpx.Request] = []
+        self.uploaded: dict[str, bytes] = {}
+        self.file_names: list[str] = []
+        self.submit_payload: dict | None = None
+        self.poll_count = 0
 
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
 
-def poll(batch_id: str, token: str, interval: int = 10, timeout: int = 7200) -> list[dict]:
-    """Poll until every file reaches done or failed."""
-    url = f"{API}/extract-results/batch/{batch_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    start = time.time()
-    while time.time() - start < timeout:
-        r = requests.get(url, headers=headers, timeout=60)
-        r.raise_for_status()
-        results = r.json()["data"]["extract_result"]
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        url = str(request.url)
 
-        parts = []
-        for res in results:
-            state = res.get("state")
+        if request.method == "POST" and "/file-urls/batch" in url:
+            return self._submit(request)
+        if request.method == "PUT":
+            name = url.split("/upload/")[1].split("?")[0]
+            self.uploaded[name] = request.content
+            return httpx.Response(self.upload_status)
+        if request.method == "GET" and "/extract-results/batch/" in url:
+            return self._poll()
+        if request.method == "GET" and "/results/" in url:
+            name = url.split("/results/")[1].removesuffix(".zip")
+            return httpx.Response(200, content=_make_zip(self.markdown[name], self.images))
+
+        return httpx.Response(404, text=f"unexpected request: {request.method} {url}")
+
+    def _submit(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        self.submit_payload = payload
+        self.file_names = [f["name"] for f in payload["files"]]
+        if self.submit_code != 0:
+            return httpx.Response(
+                200, json={"code": self.submit_code, "msg": self.submit_msg, "data": None}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "batch_id": BATCH_ID,
+                    "file_urls": [UPLOAD_URL.format(name=n) for n in self.file_names],
+                },
+            },
+        )
+
+    def _poll(self) -> httpx.Response:
+        states = (
+            self.poll_states[min(self.poll_count, len(self.poll_states) - 1)]
+            if self.poll_states
+            else ["done"] * len(self.file_names)
+        )
+        self.poll_count += 1
+
+        entries = []
+        for name, state in zip(self.file_names, states):
+            entry: dict = {"file_name": name, "state": state}
             if state == "running":
-                p = res.get("extract_progress") or {}
-                parts.append(f"{res['file_name']}: {p.get('extracted_pages', '?')}/{p.get('total_pages', '?')}")
+                entry["extract_progress"] = {"extracted_pages": 40, "total_pages": 190}
+            elif state == "done":
+                entry["full_zip_url"] = ZIP_URL.format(name=name.removesuffix(".pdf"))
             else:
-                parts.append(f"{res['file_name']}: {state}")
-        print(f"  [{int(time.time() - start):>4}s] " + " | ".join(parts))
+                entry["err_msg"] = self.err_msgs.get(name, "something went wrong")
+            entries.append(entry)
 
-        if all(r_.get("state") in ("done", "failed") for r_ in results):
-            return results
-        time.sleep(interval)
-    raise TimeoutError(f"timed out after {timeout}s; batch_id={batch_id}")
+        return httpx.Response(200, json={"code": 0, "data": {"extract_result": entries}})
 
 
-def download_and_merge(results: list[dict], out_dir: Path) -> Path:
-    """Download each result zip and merge into one markdown + images/ folder.
-
-    Image filenames are content hashes, so they are unique across parts and can
-    share one flat images/ directory without collision.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    images = out_dir / "images"
-    images.mkdir(exist_ok=True)
-
-    chunks: list[str] = []
-    for res in sorted(results, key=lambda r: r["file_name"]):
-        if res.get("state") != "done":
-            print(f"  SKIPPING {res['file_name']}: {res.get('state')} - {res.get('err_msg')}")
-            continue
-        print(f"  downloading {res['file_name']}...", end=" ", flush=True)
-        blob = requests.get(res["full_zip_url"], timeout=1800).content
-        print(f"{len(blob) / 1e6:.1f} MB")
-
-        with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            md_names = [n for n in z.namelist() if n.endswith(".md")]
-            # 'full.md' is the documented markdown output name.
-            md_name = next((n for n in md_names if Path(n).name == "full.md"), md_names[0])
-            chunks.append(z.read(md_name).decode("utf-8"))
-            for name in z.namelist():
-                if "/images/" in name and not name.endswith("/"):
-                    target = images / Path(name).name
-                    if not target.exists():
-                        target.write_bytes(z.read(name))
-
-    merged = out_dir / "merged.md"
-    merged.write_text("\n\n".join(chunks), encoding="utf-8")
-    n_images = sum(1 for _ in images.iterdir())
-    print(f"\nwrote {merged} ({len(merged.read_text(encoding='utf-8')):,} chars)")
-    print(f"      {images} ({n_images} files)")
-    return merged
+@pytest.fixture(autouse=True)
+def _no_poll_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "MINERU_POLL_INTERVAL_SECONDS", 0)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("pdf", type=Path)
-    ap.add_argument("-o", "--out", type=Path, default=Path("mineru_out"))
-    ap.add_argument("--token", default=os.environ.get("MINERU_TOKEN"))
-    ap.add_argument("--model", default="vlm", choices=["vlm", "pipeline"])
-    ap.add_argument("--language", default="ch")
-    args = ap.parse_args()
-
-    if not args.token:
-        print("error: set MINERU_TOKEN or pass --token")
-        return 1
-    if not args.pdf.exists():
-        print(f"error: {args.pdf} not found")
-        return 1
-
-    print(f"splitting {args.pdf.name} (max {MAX_PAGES} pages per part)...")
-    parts = split_pdf(args.pdf, args.out / "parts")
-
-    print(f"\nsubmitting {len(parts)} file(s), model={args.model}...")
-    batch_id = submit(parts, args.token, args.model, args.language)
-
-    print("\npolling...")
-    results = poll(batch_id, args.token)
-
-    failed = [r for r in results if r.get("state") == "failed"]
-    if failed:
-        print(f"\n{len(failed)} file(s) failed:")
-        for r in failed:
-            print(f"  {r['file_name']}: {r.get('err_msg')}")
-
-    print("\ndownloading results...")
-    download_and_merge(results, args.out)
-    return 1 if failed else 0
+# ── Token handling ──────────────────────────────────────────────────────────
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def test_missing_token_raises_with_actionable_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "MINERU_TOKEN", None)
+    with pytest.raises(MinerUError, match="MINERU_TOKEN"):
+        MinerUClient()
+
+
+def test_token_is_sent_as_a_bearer_header() -> None:
+    api = FakeAPI(markdown={"book": "# Title"})
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        client.submit([])
+    assert api.requests[0].headers["Authorization"] == "Bearer tok"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("A0202", "rejected"),
+        ("A0211", "expired"),
+        ("-60005", "MB per-file limit"),
+        ("-60006", "page per-file"),
+        ("-60018", "daily task limit"),
+    ],
+)
+def test_documented_error_codes_become_useful_messages(
+    tmp_path: Path, code: str, expected: str
+) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI(submit_code=code, submit_msg="server said no")
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(MinerUError) as excinfo:
+            client.submit([pdf])
+
+    message = str(excinfo.value)
+    assert expected in message
+    # The server's own message is always appended, so an unlisted code still
+    # surfaces whatever the API said.
+    assert "server said no" in message
+
+
+def test_undocumented_error_code_still_surfaces_the_server_message(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI(submit_code=-99999, submit_msg="brand new failure")
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(MinerUError, match="brand new failure"):
+            client.submit([pdf])
+
+
+# ── Upload ──────────────────────────────────────────────────────────────────
+
+
+def test_upload_sends_no_content_type_and_no_auth_header(tmp_path: Path) -> None:
+    """Both headers break the pre-signed URL's signature."""
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI()
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        client.submit([pdf])
+
+    put = next(r for r in api.requests if r.method == "PUT")
+    assert "content-type" not in {k.lower() for k in put.headers}
+    assert "authorization" not in {k.lower() for k in put.headers}
+    assert api.uploaded["book.pdf"] == pdf.read_bytes()
+
+
+def test_submit_requests_vlm_and_ocr_by_default(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI()
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        client.submit([pdf])
+
+    assert api.submit_payload["model_version"] == "vlm"
+    assert api.submit_payload["enable_formula"] is True
+    assert api.submit_payload["enable_table"] is True
+    assert api.submit_payload["files"][0]["is_ocr"] is True
+
+
+def test_pipeline_model_is_selectable(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI()
+
+    with MinerUClient(token="tok", model_version="pipeline", transport=api.transport()) as client:
+        client.submit([pdf])
+
+    assert api.submit_payload["model_version"] == "pipeline"
+
+
+def test_failed_upload_status_raises(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI(upload_status=403)
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(MinerUError, match="403"):
+            client.submit([pdf])
+
+
+# ── Poll ────────────────────────────────────────────────────────────────────
+
+
+def test_poll_waits_for_running_then_returns_terminal_states(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI(markdown={"book": "# Title"}, poll_states=[["running"], ["running"], ["done"]])
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        client.submit([pdf])
+        results = client.poll(BATCH_ID)
+
+    assert api.poll_count == 3
+    assert [r["state"] for r in results] == ["done"]
+
+
+def test_poll_times_out_rather_than_hanging(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 2)
+    api = FakeAPI(poll_states=[["running"]])
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        client.submit([pdf])
+        with pytest.raises(TimeoutError, match=BATCH_ID):
+            client.poll(BATCH_ID, timeout_minutes=0)
+
+
+# ── Full flow ───────────────────────────────────────────────────────────────
+
+
+def test_parse_pdf_splits_uploads_polls_and_merges(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 400)  # over SPLIT_MAX_PAGES, so this must split
+    work_dir = tmp_path / "work"
+
+    api = FakeAPI(
+        markdown={
+            "book_part_001": "# Part one\n\n![](images/aaa.jpg)",
+            "book_part_002": "# Part two\n\n![](images/bbb.jpg)",
+            "book_part_003": "# Part three",
+        },
+        images={"aaa.jpg": b"\x89PNG-a", "bbb.jpg": b"\x89PNG-b"},
+    )
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        result = parse_pdf(pdf, work_dir, client=client)
+
+    assert result.total_pages == 400
+    assert len(api.uploaded) == 3
+    assert not result.failed_parts
+
+    merged = result.merged_path.read_text(encoding="utf-8")
+    # Parts land in document order, not upload or completion order.
+    assert merged.index("Part one") < merged.index("Part two") < merged.index("Part three")
+
+    # Images from every part share one flat directory: MinerU names them by
+    # content hash, so they cannot collide.
+    assert (work_dir / "images" / "aaa.jpg").read_bytes() == b"\x89PNG-a"
+    assert (work_dir / "images" / "bbb.jpg").read_bytes() == b"\x89PNG-b"
+
+
+def test_small_pdf_is_sent_as_one_part(tmp_path: Path) -> None:
+    pdf = tmp_path / "small.pdf"
+    _make_pdf(pdf, 5)
+    api = FakeAPI(markdown={"small_part_001": "# Small"})
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        result = parse_pdf(pdf, tmp_path / "work", client=client)
+
+    assert len(api.uploaded) == 1
+    assert "Small" in result.merged_path.read_text(encoding="utf-8")
+
+
+def test_one_failed_part_is_reported_and_the_rest_still_merge(tmp_path: Path) -> None:
+    """A 3-part book where part 2 failed still produces the two that worked."""
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 400)
+    work_dir = tmp_path / "work"
+
+    api = FakeAPI(
+        markdown={"book_part_001": "# Part one", "book_part_003": "# Part three"},
+        poll_states=[["done", "failed", "done"]],
+        err_msgs={"book_part_002.pdf": "page 214 is not renderable"},
+    )
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        result = parse_pdf(pdf, work_dir, client=client)
+
+    failed = result.failed_parts
+    assert len(failed) == 1
+    assert failed[0].file_name == "book_part_002.pdf"
+    assert "not renderable" in failed[0].err_msg
+
+    merged = result.merged_path.read_text(encoding="utf-8")
+    assert "Part one" in merged and "Part three" in merged
+
+
+def test_every_part_failing_raises_rather_than_writing_an_empty_book(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 5)
+    api = FakeAPI(poll_states=[["failed"]], err_msgs={"book_part_001.pdf": "quota exhausted"})
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(MinerUError, match="quota exhausted"):
+            parse_pdf(pdf, tmp_path / "work", client=client)
+
+
+def test_reparse_is_skipped_when_merged_md_is_current(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 5)
+    work_dir = tmp_path / "work"
+    api = FakeAPI(markdown={"book_part_001": "# Book"})
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        parse_pdf(pdf, work_dir, client=client)
+        first_uploads = len(api.uploaded)
+        parse_pdf(pdf, work_dir, client=client)
+
+    assert len(api.uploaded) == first_uploads  # nothing re-uploaded
+
+
+def test_missing_pdf_raises_file_not_found(tmp_path: Path) -> None:
+    api = FakeAPI()
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(FileNotFoundError):
+            parse_pdf(tmp_path / "nope.pdf", tmp_path / "work", client=client)

@@ -1,13 +1,22 @@
 """
-CLI entry point: PDF -> Markdown (cloud or local MinerU) -> translated Markdown.
+CLI entry point: PDF -> Markdown (MinerU cloud API) -> translated Markdown.
 
 Usage
 -----
-    uv run python -m src.main <pdf_file> [--mode cloud|local] [--lang zh-CN]
+    uv run python -m src.main <pdf_file> [--lang English]
+
+This is the fully automated path, for a book you are happy to hand to the
+translating model unattended. For the reviewed path -- normalize, classify
+headings, convert tables, lint, then build -- use the four scripts instead:
+
+    scripts/parse_book.py <pdf> <work-dir>
+    scripts/prepare_kit.py <work-dir>
+    scripts/lint_translation.py <kit-dir>
+    scripts/build_pdf.py <kit-dir>
 
 Pipeline
 --------
-    1. parse_pdf(pdf_file, mode)      -> data/work/{name}/{cloud_}full.md
+    1. parse_pdf(pdf, work_dir)       -> data/work/{name}/merged.md
     2. translate_markdown(md, lang)   -> translated markdown text
     3. write data/output/{name}_translated.md
 
@@ -29,8 +38,8 @@ import argparse
 import logging
 import sys
 
-from src.config import DATA_OUTPUT
-from src.parser import parse_pdf
+from src.config import DATA_INPUT, DATA_OUTPUT, DATA_WORK
+from src.mineru_api import parse_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -55,20 +64,29 @@ def _get_translate_fn():
         return _passthrough
 
 
-def run(pdf_filename: str, mode: str | None, target_lang: str) -> None:
+def run(pdf_filename: str, target_lang: str) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    logger.info("Step 1/3: Parsing '%s' (mode=%s)...", pdf_filename, mode or "env default")
+    pdf_path = DATA_INPUT / pdf_filename
+    work_dir = DATA_WORK / pdf_path.stem.replace(" ", "_")
+
+    logger.info("Step 1/3: Parsing '%s' with the MinerU cloud API...", pdf_filename)
     try:
-        md_path = parse_pdf(pdf_filename, mode=mode)
+        result = parse_pdf(pdf_path, work_dir)
     except Exception as exc:
         logger.error("Parsing failed: %s", exc)
-        if (mode or "cloud") == "cloud":
-            logger.error("Tip: retry with --mode local to use the local MinerU pipeline.")
         sys.exit(1)
+    if result.failed_parts:
+        logger.error(
+            "%d part(s) failed and are missing from %s; not translating a partial book.",
+            len(result.failed_parts),
+            result.merged_path,
+        )
+        sys.exit(1)
+    md_path = result.merged_path
     logger.info("Parsed markdown ready: %s", md_path)
 
     logger.info("Step 2/3: Translating to %s...", target_lang)
@@ -91,15 +109,9 @@ def run(pdf_filename: str, mode: str | None, target_lang: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m src.main",
-        description="Parse a PDF (via MinerU cloud or local) and translate the resulting markdown.",
+        description="Parse a PDF with the MinerU cloud API and translate the resulting markdown.",
     )
     parser.add_argument("pdf_file", help="Name of the PDF in data/input/ (e.g., calculus.pdf)")
-    parser.add_argument(
-        "--mode",
-        choices=["cloud", "local"],
-        default=None,
-        help="MinerU parsing backend. Defaults to MINERU_MODE env var (default: cloud).",
-    )
     parser.add_argument(
         "--lang",
         default="English",
@@ -107,7 +119,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run(args.pdf_file, args.mode, args.lang)
+    run(args.pdf_file, args.lang)
 
 
 if __name__ == "__main__":

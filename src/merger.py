@@ -36,10 +36,13 @@ def merge_chunks(chunks: list[SplitChunk], book_work_dir: Path) -> Path:
     """
     Concatenate each chunk's parsed Markdown into ``book_work_dir/merged.md``.
 
-    For each chunk, this looks for ``full.md`` (local MinerU output) or
-    ``cloud_full.md`` (MinerU Cloud output) inside
-    ``book_work_dir/chunks/<chunk pdf stem>/`` -- i.e. the same per-chunk
-    work directory ``src.parser`` parses that chunk's PDF into.
+    For each chunk, this looks for ``full.md`` or ``cloud_full.md`` inside
+    ``book_work_dir/chunks/<chunk pdf stem>/``.
+
+    Note that ``src.mineru_api`` does NOT use this function: it splits with
+    zero overlap and concatenates the parts directly, keeping one flat
+    ``images/`` for the whole book. This overlap-aware merge stays for
+    callers that split with ``SPLIT_OVERLAP_PAGES`` set.
 
     Image path rewriting
     ----------------------

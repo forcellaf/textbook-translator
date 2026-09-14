@@ -5,6 +5,17 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+
+# Source books and parser output.
+# These are DATA, not code: the repo is the tool and each book lives in its
+# own data/work/<book_name>/. A 516-page scan splits into ~156 MB parts,
+# which exceed GitHub's 100 MB per-file limit outright -- and the scans and
+# their extracted text are copyrighted material that must not be published.
+*.pdf
+mineru_out/
+data/input/*
+!data/input/.gitkeep
 
 # Intermediate / generated pipeline state
 # (folders are ignored but kept in the repo via .gitkeep)

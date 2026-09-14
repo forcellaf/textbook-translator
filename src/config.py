@@ -28,6 +28,7 @@ DATA_OUTPUT = PROJECT_ROOT / "data" / "output"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 PROMPTS_DIR = PROJECT_ROOT / "src" / "prompts"
 LOGS_DIR = PROJECT_ROOT / "logs"
+ASSETS_DIR = PROJECT_ROOT / "assets"
 
 # ── Optional proxy / network setup ──────────────────────────────────────────
 # Only set these if a non-empty value is provided. Leaving them unset allows
@@ -64,25 +65,33 @@ MAX_HEAL_ATTEMPTS: int = int(os.getenv("MAX_HEAL_ATTEMPTS", "3"))
 # ceiling. Raise it for a book that deliberately keeps source-script terms.
 SOURCE_RESIDUE_THRESHOLD: float = float(os.getenv("SOURCE_RESIDUE_THRESHOLD", "0.04"))
 
-# ── MinerU (PDF -> Markdown) ────────────────────────────────────────────────
-# `MINERU_MODE` selects the default parsing backend for `src.parser.parse_pdf`:
-#   "cloud" (default) - MinerU Cloud API (v4), fast, no local GPU/CPU cost.
-#   "local"           - local `magic_pdf` library (kept for future CUDA use).
-# MINERU_API_KEY is not validated here because not every invocation needs it
-# (e.g. running only the local parser, or only the translator). The MinerU
-# client validates it lazily, at construction time.
-MINERU_MODE: str = os.getenv("MINERU_MODE", "cloud").lower()
-MINERU_API_KEY: str | None = os.getenv("MINERU_API_KEY")
+# ── MinerU cloud API (PDF -> Markdown) ──────────────────────────────────────
+# The only parsing backend. The local `magic_pdf` library was removed: it is
+# the source of the historical parse defects (merged table cells destroyed,
+# space-mangled LaTeX, welded `$$$$` delimiters) that the cloud VLM backend
+# does not produce.
+#
+# MINERU_TOKEN is not validated here because not every invocation needs it
+# (e.g. running only lint or the build). `src.mineru_api.MinerUClient`
+# validates it lazily, at construction time -- the same provider-conditional
+# style used for the LLM keys below.
+MINERU_TOKEN: str | None = os.getenv("MINERU_TOKEN") or os.getenv("MINERU_API_KEY")
 MINERU_API_BASE: str = os.getenv("MINERU_API_BASE", "https://mineru.net/api/v4").rstrip("/")
-MINERU_MAX_FILE_MB: int = int(os.getenv("MINERU_MAX_FILE_MB", "200"))
 MINERU_POLL_INTERVAL_SECONDS: int = int(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "10"))
-MINERU_TIMEOUT_MINUTES: int = int(os.getenv("MINERU_TIMEOUT_MINUTES", "30"))
-# One of "pipeline", "vlm", "MinerU-HTML" (per MinerU v4 "precision parse" API).
+MINERU_TIMEOUT_MINUTES: int = int(os.getenv("MINERU_TIMEOUT_MINUTES", "120"))
+# "vlm" or "pipeline". MinerU's docs describe `pipeline` as "no hallucinations"
+# and `vlm` as higher accuracy; measured on this project's physics textbook,
+# `vlm` is dramatically cleaner (`$10^{-20}$` where pipeline gives
+# `$1 0 ^ { - 2 0 }$`). It remains a real per-book judgement call for
+# formula-dense material, so keep both selectable.
 MINERU_MODEL_VERSION: str = os.getenv("MINERU_MODEL_VERSION", "vlm")
+MINERU_LANGUAGE: str = os.getenv("MINERU_LANGUAGE", "ch")
 # Upload to Aliyun OSS can be slow/unstable on some networks; these control
 # how patiently/persistently we retry the raw PUT upload.
 MINERU_UPLOAD_MAX_RETRIES: int = int(os.getenv("MINERU_UPLOAD_MAX_RETRIES", "5"))
 MINERU_UPLOAD_TIMEOUT_SECONDS: float = float(os.getenv("MINERU_UPLOAD_TIMEOUT_SECONDS", "900"))
+# Free-tier quota, used only to log how much of the day's budget a book eats.
+MINERU_DAILY_PAGE_QUOTA: int = int(os.getenv("MINERU_DAILY_PAGE_QUOTA", "1000"))
 
 # ── DeepSeek (translation) ──────────────────────────────────────────────────
 DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
@@ -109,10 +118,20 @@ if LLM_PROVIDER in _PROVIDER_KEYS and not _PROVIDER_KEYS[LLM_PROVIDER]:
 
 # ── PDF splitting (src.splitter / src.merger / src.chapter_splitter) ───────
 # MinerU's Precision Extract API hard-limits uploads to <= 200 pages and
-# <= 200 MB per file. Large textbooks are pre-split into overlapping chunks
-# before parsing, then the resulting per-chunk Markdown is merged back
-# together. See src/parser.py::parse_book for the orchestrator.
+# <= 200 MB per file, so large textbooks are pre-split before parsing.
+#
+# `src.mineru_api` splits with ZERO overlap: MinerU parses each part
+# independently and its output is concatenated verbatim, so an overlap would
+# duplicate whole pages rather than help. `SPLIT_OVERLAP_PAGES` still applies
+# to `src.merger.merge_chunks`, which is overlap-aware and used by callers
+# that want the deduplicating merge.
 PDF_SPLIT_ENABLED: bool = os.getenv("PDF_SPLIT_ENABLED", "true").lower() in ("1", "true", "yes")
 SPLIT_MAX_PAGES: int = int(os.getenv("SPLIT_MAX_PAGES", "190"))  # API hard limit 200
 SPLIT_MAX_SIZE_MB: int = int(os.getenv("SPLIT_MAX_SIZE_MB", "180"))  # API hard limit 200 MB
 SPLIT_OVERLAP_PAGES: int = int(os.getenv("SPLIT_OVERLAP_PAGES", "2"))
+
+# ── Translation kit (src.kit) ───────────────────────────────────────────────
+# The binding constraint on chunk size is the translating model's OUTPUT
+# limit, not its context window: it has to emit a full translation of every
+# chunk it is given. ~50k source characters is what fits comfortably.
+KIT_CHUNK_CHARS: int = int(os.getenv("KIT_CHUNK_CHARS", "50000"))
