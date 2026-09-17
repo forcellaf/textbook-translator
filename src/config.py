@@ -133,5 +133,16 @@ SPLIT_OVERLAP_PAGES: int = int(os.getenv("SPLIT_OVERLAP_PAGES", "2"))
 # ── Translation kit (src.kit) ───────────────────────────────────────────────
 # The binding constraint on chunk size is the translating model's OUTPUT
 # limit, not its context window: it has to emit a full translation of every
-# chunk it is given. ~50k source characters is what fits comfortably.
-KIT_CHUNK_CHARS: int = int(os.getenv("KIT_CHUNK_CHARS", "50000"))
+# chunk it is given.
+#
+# Measured on the completed book, translated output ran 1.33x to 2.87x the
+# input length (mean 2.29x), and the largest single reply was 143,000
+# characters (~36,000 tokens) -- occasionally over the model's output limit,
+# coming back truncated for the user to spot and repair by hand. LaTeX output
+# is more verbose than the Markdown those numbers were measured on (a figure
+# goes from `![](IMG_0042)` to a `\bookfig{...}{...}` call with a translated
+# caption, across ~800 figures), so the worst case gets worse, not better.
+#
+# At 30,000 characters the worst case lands near 87,000 characters ~ 22,000
+# tokens, comfortably inside the limit.
+KIT_CHUNK_CHARS: int = int(os.getenv("KIT_CHUNK_CHARS", "30000"))

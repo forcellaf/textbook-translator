@@ -1,5 +1,10 @@
 """
-The translation stage: Markdown in, translated Markdown or LaTeX out.
+The translation stage: Markdown in, translated LaTeX out.
+
+This is the automated path, for a book handed to an API model unattended.
+The reviewed path -- where the chunks are pasted into AI Studio by hand -- is
+``src.kit``. Both use the same system prompt asset and the same assembly, so
+a book can move between them.
 
 Layout
 ------
@@ -53,20 +58,16 @@ from src.config import (
     SOURCE_RESIDUE_THRESHOLD,
     TARGET_LANG,
 )
-from src.latex import assemble_document, validate_fragment
+from src.latex import assemble_document, build_system_prompt, validate_fragment
 from src.llm.base import BaseLLM
-from src.profiler import BookProfile, profile_book, profile_to_prompt_block
+from src.profiler import BookProfile, profile_book
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_FORMATS: tuple[str, ...] = ("markdown", "latex")
-
 CHAPTERS_DIRNAME = "chapters"
 TRANSLATED_CHAPTERS_DIRNAME = "translated_chapters"
-TRANSLATED_MERGED_NAME = "translated_merged.md"
 TRANSLATED_TEX_NAME = "translated_book.tex"
-
-_FORMAT_SUFFIXES = {"markdown": ".md", "latex": ".tex"}
+CHECKPOINT_SUFFIX = ".tex"
 
 # No tokenizer ships with this project, so chunk budgets are estimated from
 # character count. The ratio is skewed toward the CJK end (CJK is roughly one
@@ -159,77 +160,12 @@ def chunk_markdown(text: str, max_tokens: int = MAX_CHUNK_TOKENS) -> list[str]:
 
 
 # ── Prompts ─────────────────────────────────────────────────────────────────
-
-_MARKDOWN_RULES = """\
-Rules:
-- Output ONLY the translated Markdown. No preamble, no commentary, no code
-  fences around the whole answer, no notes about what you did.
-- Preserve the Markdown structure exactly: heading levels, list markers,
-  table pipes, block quotes, emphasis, and blank-line paragraph breaks.
-- Preserve every formula verbatim, inline ($...$) and display ($$...$$)
-  alike. Translate surrounding prose, never the mathematics itself: do not
-  "fix", simplify, re-derive or re-number formulas.
-- Keep image references exactly as given, including the path:
-  ![alt](path/to/image.jpg) -- translate the alt text only.
-- Translate every piece of prose. Do not leave source-language text in the
-  output, and do not add content that is not in the source."""
-
-_LATEX_RULES = """\
-
-Your PRIMARY task is translation. Converting Markdown to LaTeX is secondary.
-A structurally perfect LaTeX document that is still in the source language is
-a FAILED answer.
-
-- Translate ALL prose: chapter and section titles, body paragraphs, figure
-  captions, table cells, exercise text, footnotes.
-- The ONLY things that keep their original form are mathematics and image
-  paths. Everything else must be in the target language.
-
-Output LaTeX body content only.
-
-Hard constraints -- the preamble is generated separately and yours would
-conflict with it:
-- NEVER emit \\documentclass, \\usepackage, \\begin{document} or
-  \\end{document}.
-- NEVER wrap the answer in ``` code fences, and never add commentary.
-
-Structure mapping:
-- Markdown '# '   -> \\chapter{...}
-- Markdown '## '  -> \\section{...}
-- Markdown '### ' -> \\subsection{...}
-- Bulleted lists -> itemize; numbered lists -> enumerate.
-- Tables -> tabular inside a table float, using booktabs rules (\\toprule,
-  \\midrule, \\bottomrule).
-- ![alt](path) -> a figure float with \\includegraphics{path}, keeping the
-  path EXACTLY as given, and the translated alt text as the \\caption.
-
-Mathematics:
-- Preserve all math verbatim. Never "fix", simplify or re-derive a formula.
-- Inline $...$ stays inline. Display math becomes an equation environment or
-  \\[ ... \\].
-
-Escaping:
-- In prose, escape &, %, #, _ and any literal $ as \\&, \\%, \\#, \\_, \\$.
-- Every \\begin must have a matching \\end, and braces must balance."""
-
-
-def build_system_prompt(
-    *,
-    source_lang: str,
-    target_lang: str,
-    profile: BookProfile | None = None,
-    output_format: str = "markdown",
-) -> str:
-    """Assemble the system prompt for one chunk translation."""
-    rules = _LATEX_RULES if output_format == "latex" else _MARKDOWN_RULES
-    parts = [
-        f"You are an expert {source_lang}-to-{target_lang} translator working on "
-        "one excerpt of a textbook. Translate the excerpt the user sends you.",
-        rules,
-    ]
-    if profile is not None:
-        parts.append(profile_to_prompt_block(profile))
-    return "\n\n".join(parts)
+#
+# The system prompt is `assets/system_prompt_latex.txt`, loaded by
+# `src.latex.build_system_prompt`. It lives in a file, not here, because it is
+# edited by hand between books -- and because the API path and the paste-it-
+# into-AI-Studio path must send the model exactly the same instructions, or a
+# book that moves between them changes shape halfway through.
 
 
 def _heal_prompt(system_prompt: str, problem: str) -> str:
@@ -395,7 +331,6 @@ def _source_residue(output: str, source_lang: str, target_lang: str) -> float | 
 def _diagnose(
     source: str,
     output: str,
-    output_format: str,
     *,
     source_lang: str = SOURCE_LANG,
     target_lang: str = TARGET_LANG,
@@ -416,10 +351,9 @@ def _diagnose(
     if residue is not None and residue > SOURCE_RESIDUE_THRESHOLD:
         return f"output is still {residue:.0%} {source_lang} - the text was not translated"
 
-    if output_format == "latex":
-        issues = validate_fragment(stripped)
-        if issues:
-            return "invalid LaTeX: " + "; ".join(issues)
+    issues = validate_fragment(stripped)
+    if issues:
+        return "invalid LaTeX: " + "; ".join(issues)
 
     return None
 
@@ -455,28 +389,23 @@ def translate_chunk(
     source_lang: str = SOURCE_LANG,
     target_lang: str = TARGET_LANG,
     profile: BookProfile | None = None,
-    output_format: str = "markdown",
 ) -> str:
-    """Translate one chunk, healing bad-but-successful responses.
+    """Translate one chunk into a LaTeX body fragment, healing bad responses.
+
+    ``source_lang``/``target_lang`` drive the residue check below, not the
+    prompt: the prompt is the asset file, which states its own language pair.
 
     Raises:
         TranslationError: if the API itself keeps failing. This propagates
             out of the heal loop immediately and on purpose -- see the module
             docstring.
     """
-    system_prompt = build_system_prompt(
-        source_lang=source_lang,
-        target_lang=target_lang,
-        profile=profile,
-        output_format=output_format,
-    )
+    system_prompt = build_system_prompt(profile)
 
     # Layer 1 (transient failures) happens inside this call; a permanent
     # failure raises TranslationError here and never reaches the heal loop.
     result = _strip_wrapping_fence(_generate_with_retry(llm, system_prompt, chunk))
-    problem = _diagnose(
-        chunk, result, output_format, source_lang=source_lang, target_lang=target_lang
-    )
+    problem = _diagnose(chunk, result, source_lang=source_lang, target_lang=target_lang)
 
     # Layer 2: the API is answering, the answer is just unusable.
     for attempt in range(1, MAX_HEAL_ATTEMPTS + 1):
@@ -491,9 +420,7 @@ def translate_chunk(
         result = _strip_wrapping_fence(
             _generate_with_retry(llm, _heal_prompt(system_prompt, problem), chunk)
         )
-        problem = _diagnose(
-            chunk, result, output_format, source_lang=source_lang, target_lang=target_lang
-        )
+        problem = _diagnose(chunk, result, source_lang=source_lang, target_lang=target_lang)
 
     if problem is not None:
         # Returning imperfect text beats aborting a multi-hour book run over
@@ -509,13 +436,6 @@ def translate_chunk(
 # ── Document translation ────────────────────────────────────────────────────
 
 
-def _validate_output_format(output_format: str) -> None:
-    if output_format not in OUTPUT_FORMATS:
-        raise ValueError(
-            f"Unknown output_format {output_format!r}; expected one of {list(OUTPUT_FORMATS)}"
-        )
-
-
 def translate_markdown(
     markdown_text: str,
     target_lang: str = TARGET_LANG,
@@ -524,9 +444,8 @@ def translate_markdown(
     llm: BaseLLM | None = None,
     on_chunk_done: Callable[[int, int, str], None] | None = None,
     profile: BookProfile | None = None,
-    output_format: str = "markdown",
 ) -> str:
-    """Translate a whole Markdown document, chunk by chunk.
+    """Translate a whole Markdown document into LaTeX, chunk by chunk.
 
     Args:
         markdown_text: The source document.
@@ -535,14 +454,13 @@ def translate_markdown(
         llm: Provider to use. Defaults to the configured one.
         on_chunk_done: Progress callback, called as
             ``(index, total, translated_chunk)`` with a 1-based index.
-        profile: Book context to prepend to every chunk's system prompt.
-        output_format: ``"markdown"`` or ``"latex"``.
+        profile: Book context folded into every chunk's system prompt.
 
     Returns:
-        The translated document. ``""`` for empty input.
+        The translated body fragments, joined. ``""`` for empty input. This
+        is not a compilable document on its own -- see
+        ``src.latex.assemble_document``.
     """
-    _validate_output_format(output_format)
-
     chunks = chunk_markdown(markdown_text)
     if not chunks:
         return ""
@@ -561,7 +479,6 @@ def translate_markdown(
             source_lang=source_lang,
             target_lang=target_lang,
             profile=profile,
-            output_format=output_format,
         )
         translated.append(piece)
         if on_chunk_done is not None:
@@ -573,14 +490,9 @@ def translate_markdown(
 # ── Book translation ────────────────────────────────────────────────────────
 
 
-def _checkpoint_path(checkpoint_dir: Path, chapter_path: Path, output_format: str) -> Path:
-    """Checkpoint path for one chapter, carrying a format-specific suffix.
-
-    The suffix is what stops a run with ``output_format="latex"`` from
-    happily reusing Markdown checkpoints written by an earlier run (and
-    assembling a .tex file half-full of Markdown).
-    """
-    return checkpoint_dir / f"{chapter_path.stem}{_FORMAT_SUFFIXES[output_format]}"
+def _checkpoint_path(checkpoint_dir: Path, chapter_path: Path) -> Path:
+    """Checkpoint path for one translated chapter."""
+    return checkpoint_dir / f"{chapter_path.stem}{CHECKPOINT_SUFFIX}"
 
 
 def _is_fresh(checkpoint: Path, source: Path) -> bool:
@@ -598,10 +510,8 @@ def translate_book(
     source_lang: str = SOURCE_LANG,
     llm: BaseLLM | None = None,
     resume: bool = True,
-    output_format: str = "markdown",
     profile: BookProfile | None = None,
     use_profile: bool = True,
-    title: str | None = None,
 ) -> Path:
     """Translate a whole book, one chapter at a time, with checkpoints.
 
@@ -620,27 +530,22 @@ def translate_book(
         source_lang: Language the book is written in.
         llm: Provider to use. Defaults to the configured one, resolved lazily.
         resume: Reuse checkpoints that are newer than their source chapter.
-        output_format: ``"markdown"`` or ``"latex"``.
         profile: Pre-computed book profile; skips the profiling call.
         use_profile: Set False to translate without any book context.
-        title: Document title for LaTeX output. Defaults to the work
-            directory's name.
 
     Returns:
-        Path to ``translated_merged.md`` or ``translated_book.tex``.
+        Path to ``translated_book.tex``. The figures must sit in
+        ``images/`` beside it for the build to resolve them.
 
     Raises:
-        ValueError: For an unknown ``output_format`` (checked before any work).
         TranslationError: If the LLM fails permanently on some chunk.
     """
-    _validate_output_format(output_format)
-
     chapter_result = split_into_chapters(merged_md_path, work_dir / CHAPTERS_DIRNAME)
     checkpoint_dir = work_dir / TRANSLATED_CHAPTERS_DIRNAME
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoints = [
-        (chapter, _checkpoint_path(checkpoint_dir, chapter.file_path, output_format))
+        (chapter, _checkpoint_path(checkpoint_dir, chapter.file_path))
         for chapter in chapter_result.chapters
     ]
     pending = [
@@ -676,7 +581,6 @@ def translate_book(
             source_lang=source_lang,
             llm=llm,
             profile=profile,
-            output_format=output_format,
         )
         checkpoint.write_text(translated, encoding="utf-8")
 
@@ -686,25 +590,11 @@ def translate_book(
         if checkpoint.exists()
     ]
 
-    if output_format == "markdown":
-        output_path = work_dir / TRANSLATED_MERGED_NAME
-        output_path.write_text("\n\n".join(bodies).strip() + "\n", encoding="utf-8")
-        logger.info("Wrote translated Markdown: %s", output_path)
-        return output_path
-
-    return assemble_document(
-        bodies,
-        profile or BookProfile.generic(),
-        title or work_dir.name,
-        work_dir / TRANSLATED_TEX_NAME,
-        target_lang=target_lang,
-    )
+    return assemble_document(bodies, work_dir / TRANSLATED_TEX_NAME)
 
 
 __all__ = [
-    "OUTPUT_FORMATS",
     "TranslationError",
-    "build_system_prompt",
     "chunk_markdown",
     "estimate_tokens",
     "translate_book",

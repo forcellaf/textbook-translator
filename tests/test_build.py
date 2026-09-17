@@ -1,99 +1,184 @@
-"""Tests for src.build (assembled Markdown -> PDF via pandoc).
+"""Tests for src.build (assembled LaTeX -> PDF).
 
-The flag set is asserted directly rather than by building, so the suite does
-not need pandoc or a TeX distribution installed. Each flag here fixes
-something observed going wrong in a real build.
+No TeX distribution is needed: the engine is stubbed out and what is asserted
+is the argv and the failure handling. Every failure mode here has to come
+back as a value rather than an exception -- the caller prints it and moves
+on.
 """
 
 from __future__ import annotations
 
-import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from src.build import HEADER_TEX, BuildError, build_pdf, pandoc_command
+from src.build import DEFAULT_ENGINE, build_pdf, log_excerpt
 
 
-def _argv(tmp_path: Path, **kwargs: object) -> list[str]:
-    markdown = tmp_path / "book.md"
-    markdown.write_text("# Title\n", encoding="utf-8")
-    return pandoc_command(markdown, tmp_path / "book.pdf", **kwargs)  # type: ignore[arg-type]
+class FakeRun:
+    """Records each engine invocation and returns a scripted exit code."""
+
+    def __init__(self, returncode: int = 0, *, make_pdf: bool = True) -> None:
+        self.returncode = returncode
+        self.make_pdf = make_pdf
+        self.calls: list[tuple[list[str], Path]] = []
+
+    def __call__(self, command, *, cwd, **_kwargs):  # noqa: ANN001 - subprocess shim
+        self.calls.append((list(command), Path(cwd)))
+        if self.make_pdf and self.returncode == 0:
+            (Path(cwd) / Path(command[-1]).with_suffix(".pdf").name).write_bytes(b"%PDF-1.5")
+        return subprocess.CompletedProcess(command, self.returncode, "", "")
 
 
-def test_command_uses_xelatex_with_a_toc(tmp_path: Path) -> None:
-    argv = _argv(tmp_path)
-    assert "--pdf-engine=xelatex" in argv
-    assert "--toc" in argv
+def _book(tmp_path: Path) -> Path:
+    tex_path = tmp_path / "translated_book.tex"
+    tex_path.write_text(
+        "\\documentclass{book}\n\\begin{document}\nx\n\\end{document}\n", encoding="utf-8"
+    )
+    return tex_path
 
 
-def test_command_sets_the_book_class(tmp_path: Path) -> None:
-    argv = _argv(tmp_path)
-    assert "documentclass=book" in argv
-    assert "geometry:margin=2.5cm" in argv
+def _patch(monkeypatch: pytest.MonkeyPatch, runner: FakeRun) -> None:
+    monkeypatch.setattr("src.build.shutil.which", lambda engine: f"/usr/bin/{engine}")
+    monkeypatch.setattr("src.build.subprocess.run", runner)
 
 
-def test_openany_removes_the_blank_versos(tmp_path: Path) -> None:
-    """Without it the book class starts every chapter on a recto page."""
-    assert "classoption=openany" in _argv(tmp_path)
+def test_the_default_engine_is_pdflatex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The preamble uses inputenc, and a finished book has no CJK left."""
+    runner = FakeRun()
+    _patch(monkeypatch, runner)
+
+    build_pdf(_book(tmp_path))
+
+    assert DEFAULT_ENGINE == "pdflatex"
+    assert all(command[0] == "pdflatex" for command, _ in runner.calls)
 
 
-def test_the_verified_header_is_included(tmp_path: Path) -> None:
-    argv = _argv(tmp_path)
-    assert "-H" in argv
-    assert str(HEADER_TEX) in argv
-
-
-def test_the_header_loads_graphicx_before_setting_gin_keys() -> None:
-    """Pandoc only emits \\usepackage{graphicx} when the document contains an
-    image, so a figure-free chapter dies on "width undefined" without this."""
-    header = HEADER_TEX.read_text(encoding="utf-8")
-    assert header.index("\\usepackage{graphicx}") < header.index("\\setkeys{Gin}")
-
-
-def test_resource_path_covers_the_markdown_dir_and_its_images(tmp_path: Path) -> None:
-    argv = _argv(tmp_path)
-    resource_path = argv[argv.index("--resource-path") + 1]
-    parts = resource_path.split(os.pathsep)
-
-    assert str(tmp_path) in parts
-    assert str(tmp_path / "images") in parts
-
-
-def test_cjk_font_is_omitted_unless_asked_for(tmp_path: Path) -> None:
-    """A fully translated book needs no CJK font."""
-    assert not any("CJKmainfont" in arg for arg in _argv(tmp_path))
-    assert any("CJKmainfont=Noto Sans CJK SC" == arg for arg in _argv(tmp_path, cjk_font="Noto Sans CJK SC"))
-
-
-def test_missing_markdown_raises_file_not_found(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        build_pdf(tmp_path / "nope.md")
-
-
-def test_missing_pandoc_is_an_actionable_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    markdown = tmp_path / "book.md"
-    markdown.write_text("# Title\n", encoding="utf-8")
-    monkeypatch.setattr("src.build.shutil.which", lambda _: None)
-
-    with pytest.raises(BuildError, match="pandoc.org/installing"):
-        build_pdf(markdown)
-
-
-def test_a_pandoc_failure_surfaces_the_tail_of_its_log(
+def test_it_runs_twice_so_the_table_of_contents_resolves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """LaTeX reports its error near the end of a very long log."""
-    markdown = tmp_path / "book.md"
-    markdown.write_text("# Title\n", encoding="utf-8")
+    """One pass writes the .toc; the second typesets it. A single pass gives
+    a book with an empty contents page and no error."""
+    runner = FakeRun()
+    _patch(monkeypatch, runner)
 
-    class Result:
-        returncode = 43
-        stdout = ""
-        stderr = "noise\n" * 5000 + "! Undefined control sequence \\frobnicate"
+    succeeded, message = build_pdf(_book(tmp_path))
 
-    monkeypatch.setattr("src.build.shutil.which", lambda _: "/usr/bin/pandoc")
-    monkeypatch.setattr("src.build.subprocess.run", lambda *a, **k: Result())
+    assert succeeded, message
+    assert len(runner.calls) == 2
 
-    with pytest.raises(BuildError, match=r"Undefined control sequence"):
-        build_pdf(markdown)
+
+def test_it_never_waits_for_keyboard_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A macro the model invented would otherwise hang the build forever."""
+    runner = FakeRun()
+    _patch(monkeypatch, runner)
+
+    build_pdf(_book(tmp_path))
+
+    assert "-interaction=nonstopmode" in runner.calls[0][0]
+
+
+def test_it_compiles_in_the_directory_holding_the_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """\\graphicspath{{images/}} is relative to the .tex file."""
+    runner = FakeRun()
+    _patch(monkeypatch, runner)
+    tex_path = _book(tmp_path)
+
+    build_pdf(tex_path)
+
+    assert runner.calls[0][1] == tex_path.parent
+
+
+def test_a_different_engine_can_be_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """assets/preamble.tex documents a two-line swap to XeLaTeX for a book
+    that does end up with residual CJK."""
+    runner = FakeRun()
+    _patch(monkeypatch, runner)
+
+    build_pdf(_book(tmp_path), engine="xelatex")
+
+    assert runner.calls[0][0][0] == "xelatex"
+
+
+def test_a_missing_source_file_is_reported_not_raised(tmp_path: Path) -> None:
+    succeeded, message = build_pdf(tmp_path / "nope.tex")
+
+    assert succeeded is False
+    assert "not found" in message
+
+
+def test_a_missing_engine_is_an_actionable_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("src.build.shutil.which", lambda _engine: None)
+
+    succeeded, message = build_pdf(_book(tmp_path))
+
+    assert succeeded is False
+    assert "not on PATH" in message
+    assert "TeX Live" in message
+
+
+def test_a_compile_failure_returns_the_error_lines_from_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log is tens of thousands of lines; about six of them matter."""
+    tex_path = _book(tmp_path)
+    tex_path.with_suffix(".log").write_text(
+        "noise\n" * 5000
+        + "! Undefined control sequence.\nl.4812 \\frobnicate\n"
+        + "more noise\n" * 500,
+        encoding="utf-8",
+    )
+    _patch(monkeypatch, FakeRun(returncode=1))
+
+    succeeded, message = build_pdf(tex_path)
+
+    assert succeeded is False
+    assert "! Undefined control sequence." in message
+    assert "l.4812 \\frobnicate" in message
+    assert "noise" not in message
+
+
+def test_a_timeout_is_reported_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("pdflatex", 1800)
+
+    monkeypatch.setattr("src.build.shutil.which", lambda engine: f"/usr/bin/{engine}")
+    monkeypatch.setattr("src.build.subprocess.run", timeout)
+
+    succeeded, message = build_pdf(_book(tmp_path))
+
+    assert succeeded is False
+    assert "timed out" in message
+
+
+def test_a_silent_failure_to_produce_a_pdf_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch(monkeypatch, FakeRun(make_pdf=False))
+
+    succeeded, message = build_pdf(_book(tmp_path))
+
+    assert succeeded is False
+    assert "no PDF was produced" in message
+
+
+def test_log_excerpt_falls_back_to_the_tail_when_nothing_matches(tmp_path: Path) -> None:
+    log_path = tmp_path / "book.log"
+    log_path.write_text("\n".join(f"line {i}" for i in range(200)), encoding="utf-8")
+
+    assert "line 199" in log_excerpt(log_path)
+
+
+def test_log_excerpt_survives_a_missing_log(tmp_path: Path) -> None:
+    assert "no readable log" in log_excerpt(tmp_path / "gone.log")

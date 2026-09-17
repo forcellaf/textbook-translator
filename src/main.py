@@ -1,5 +1,5 @@
 """
-CLI entry point: PDF -> Markdown (MinerU cloud API) -> translated Markdown.
+CLI entry point: PDF -> Markdown (MinerU cloud API) -> translated LaTeX.
 
 Usage
 -----
@@ -17,15 +17,14 @@ headings, convert tables, lint, then build -- use the four scripts instead:
 Pipeline
 --------
     1. parse_pdf(pdf, work_dir)       -> data/work/{name}/merged.md
-    2. translate_markdown(md, lang)   -> translated markdown text
-    3. write data/output/{name}_translated.md
+    2. translate_markdown(md, lang)   -> LaTeX body fragments
+    3. assemble_document(...)         -> data/output/{name}_translated.tex
 
 Translation is implemented in `src/translator.py`. This entry point runs the
 whole-document path (`translate_markdown`), which chunks the Markdown and
 translates it chunk by chunk. For a full book, prefer
-`src.translator.translate_book`, which adds per-chapter checkpointing,
-book-level profiling (`src.profiler`) and optional LaTeX output
-(`src.latex`).
+`src.translator.translate_book`, which adds per-chapter checkpointing and
+book-level profiling (`src.profiler`).
 
 The passthrough fallback below is kept as a safety net: if `src.translator`
 cannot be imported at all, the parse step still produces output, with a clear
@@ -39,6 +38,7 @@ import logging
 import sys
 
 from src.config import DATA_INPUT, DATA_OUTPUT, DATA_WORK
+from src.latex import assemble_document
 from src.mineru_api import parse_pdf
 
 logger = logging.getLogger(__name__)
@@ -101,9 +101,14 @@ def run(pdf_filename: str, target_lang: str) -> None:
     logger.info("Step 3/3: Writing output...")
     stem = md_path.parent.name
     DATA_OUTPUT.mkdir(parents=True, exist_ok=True)
-    output_path = DATA_OUTPUT / f"{stem}_translated.md"
-    output_path.write_text(translated, encoding="utf-8")
+    output_path = DATA_OUTPUT / f"{stem}_translated.tex"
+    assemble_document([translated], output_path)
     logger.info("Done: %s", output_path)
+    logger.info(
+        "Copy %s next to it before building; the preamble's \\graphicspath "
+        "expects the figures beside the .tex.",
+        work_dir / "images",
+    )
 
 
 def main() -> None:

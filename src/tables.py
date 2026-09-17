@@ -1,12 +1,14 @@
 """
-Convert MinerU's raw HTML ``<table>`` blocks into pandoc pipe tables.
+Convert MinerU's raw HTML ``<table>`` blocks into markdown pipe tables.
 
 Why this is not optional
 ------------------------
-MinerU emits tables as raw HTML. Pandoc's markdown reader keeps raw HTML as
-an opaque block, and **the LaTeX writer discards it** -- so every table
-vanishes from the PDF, leaving the cell text scattered as loose lines. This
-conversion is the single change that gets tables into the output at all.
+MinerU emits tables as raw HTML, and the translating model has to turn every
+table into a LaTeX ``tabular``. Given a pipe table it reproduces the grid
+reliably; given a wall of ``<td>`` tags it has to infer the structure first,
+and a table whose columns it guesses wrong is not recoverable afterwards.
+Converting here makes that structure explicit once, deterministically,
+instead of once per chunk in a model.
 
 Degeneracy policy
 -----------------
@@ -188,11 +190,11 @@ def _cell_to_markdown(text: str) -> str:
 
 
 def _to_pipe_table(rows: list[list[tuple[str, int, int]]]) -> str:
-    """Render rectangular ``rows`` as a pandoc pipe table.
+    """Render rectangular ``rows`` as a markdown pipe table.
 
-    The first row becomes the header. MinerU rarely emits ``<th>``, and
-    pandoc requires a header row, so the first row is promoted -- it stays
-    visible either way, just set in bold.
+    The first row becomes the header. MinerU rarely emits ``<th>``, and a
+    pipe table needs a header row, so the first row is promoted -- it stays
+    visible either way.
     """
     rendered = [[_cell_to_markdown(text) for text, _, _ in row] for row in rows]
     columns = len(rendered[0])
@@ -237,8 +239,8 @@ def convert_html_tables(text: str) -> tuple[str, list[TableReport]]:
             return block
 
         reports.append(TableReport(counter, line, len(rows), True))
-        # Blank lines on both sides, or pandoc glues the table to adjacent
-        # prose and reads the whole thing as a paragraph.
+        # Blank lines on both sides, or the table reads as part of the
+        # adjacent prose rather than as a grid.
         return "\n\n" + _to_pipe_table(rows) + "\n\n"
 
     converted = TABLE_RE.sub(replace, text)

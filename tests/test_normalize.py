@@ -202,8 +202,8 @@ def test_math_spacing_fix_is_available_behind_the_flag() -> None:
 
 def test_math_spacing_fix_leaves_display_math_alone() -> None:
     """Display math is still character-spaced by the current parser. That is
-    cosmetic only -- with no delimiter-adjacent whitespace it causes no
-    pandoc failure -- so this pass must not touch it."""
+    cosmetic only -- with no delimiter-adjacent whitespace it compiles
+    correctly -- so this pass must not touch it."""
     text = "$$\n e = 1. 6 0 2 \\times 1 0 ^ {- 1 9} \n$$\n"
     repaired, count = fix_inline_math_spacing(text)
 

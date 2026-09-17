@@ -7,7 +7,7 @@ This script is the other half: it makes real calls, cheapest first, and stops
 at the first failure so the output points at one specific broken layer
 instead of a wall of downstream errors.
 
-    python scripts/test_api.py            # all five stages
+    python scripts/test_api.py            # all four stages
     python scripts/test_api.py --quick    # stages 1-2 only (credentials + one call)
 
 Note on stage 3: a fallback to the generic profile counts as a FAILURE here,
@@ -208,46 +208,8 @@ def stage_3_profile(llm: object, work_dir: Path) -> object:
     return profile
 
 
-def stage_4_markdown(llm: object, profile: object) -> None:
-    """translate_markdown in Markdown mode, plus structural spot-checks."""
-    from src.translator import TranslationError, translate_markdown
-
-    try:
-        result = translate_markdown(
-            SAMPLE_MARKDOWN,
-            "English",
-            llm=llm,  # type: ignore[arg-type]
-            profile=profile,  # type: ignore[arg-type]
-            output_format="markdown",
-        )
-    except TranslationError as exc:
-        raise StageFailure(
-            f"Markdown translation failed: {exc}",
-            "The API accepted stage 2 but failed here; this usually means rate limiting on "
-            "longer inputs. Lower MAX_CHUNK_TOKENS or retry in a few minutes.",
-        ) from exc
-
-    problems = []
-    if "#" not in result:
-        problems.append("no Markdown heading survived")
-    if "\\lim" not in result:
-        problems.append("the display formula (\\lim) was not preserved")
-    if "|" not in result:
-        problems.append("the Markdown table was not preserved")
-    if _has_cjk(result):
-        problems.append("untranslated Chinese text remains in the output")
-
-    if problems:
-        raise StageFailure(
-            "Markdown output failed structural checks: " + "; ".join(problems),
-            "The model is not following the Markdown rules in "
-            "src/translator.py::_MARKDOWN_RULES. Try a stronger GEMINI_MODEL.",
-        )
-    print(f"    {len(result)} chars, heading + math + table preserved, no CJK left")
-
-
-def stage_5_latex(llm: object, profile: object) -> None:
-    """translate_markdown in LaTeX mode, plus validation and leakage checks."""
+def stage_4_latex(llm: object, profile: object) -> None:
+    """translate_markdown end to end, plus validation and leakage checks."""
     from src.latex import validate_fragment
     from src.translator import TranslationError, translate_markdown
 
@@ -257,20 +219,32 @@ def stage_5_latex(llm: object, profile: object) -> None:
             "English",
             llm=llm,  # type: ignore[arg-type]
             profile=profile,  # type: ignore[arg-type]
-            output_format="latex",
         )
     except TranslationError as exc:
         raise StageFailure(
-            f"LaTeX translation failed: {exc}",
-            "See the stage 4 hint; the LaTeX prompt is longer, so rate limits bite sooner.",
+            f"Translation failed: {exc}",
+            "The API accepted stage 2 but failed here; this usually means rate limiting on "
+            "longer inputs. Lower MAX_CHUNK_TOKENS or retry in a few minutes.",
         ) from exc
+
+    problems = []
+    if "\\lim" not in result:
+        problems.append("the display formula (\\lim) was not preserved")
+    if _has_cjk(result):
+        problems.append("untranslated Chinese text remains in the output")
+    if problems:
+        raise StageFailure(
+            "The translation failed structural checks: " + "; ".join(problems),
+            "The model is not following assets/system_prompt_latex.txt. Try a stronger "
+            "model, or tighten the rule it broke -- that file is meant to be edited.",
+        )
 
     issues = validate_fragment(result)
     if issues:
         raise StageFailure(
             "The LaTeX fragment is structurally invalid: " + "; ".join(issues),
             "The heal loop in translate_chunk should have caught this -- if it did not, "
-            "raise MAX_HEAL_ATTEMPTS or check src/translator.py::_LATEX_RULES.",
+            "raise MAX_HEAL_ATTEMPTS or tighten assets/system_prompt_latex.txt.",
         )
 
     leaked = [
@@ -281,8 +255,8 @@ def stage_5_latex(llm: object, profile: object) -> None:
     if leaked:
         raise StageFailure(
             f"Preamble/fence leakage in the fragment: {', '.join(leaked)}",
-            "src/latex.py owns the preamble; the model must emit body content only. "
-            "Check the hard constraints in src/translator.py::_LATEX_RULES.",
+            "assets/preamble.tex owns the preamble; the model must emit body content "
+            "only. Tighten the output rules in assets/system_prompt_latex.txt.",
         )
 
     print(f"    {len(result)} chars, validate_fragment clean, no preamble leakage")
@@ -314,7 +288,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    total = 2 if args.quick else 5
+    total = 2 if args.quick else 4
     print(f"Running {total} stage(s) against the real API.\n")
 
     try:
@@ -327,7 +301,7 @@ def main() -> int:
         print("  OK\n")
 
         if args.quick:
-            print("Quick mode: stages 3-5 skipped. Credentials and the provider work.")
+            print("Quick mode: stages 3-4 skipped. Credentials and the provider work.")
             return 0
 
         args.work_dir.mkdir(parents=True, exist_ok=True)
@@ -336,12 +310,8 @@ def main() -> int:
         profile = stage_3_profile(llm, args.work_dir)
         print("  OK\n")
 
-        print(f"[4/{total}] Markdown translation...")
-        stage_4_markdown(llm, profile)
-        print("  OK\n")
-
-        print(f"[5/{total}] LaTeX translation...")
-        stage_5_latex(llm, profile)
+        print(f"[4/{total}] LaTeX translation...")
+        stage_4_latex(llm, profile)
         print("  OK\n")
 
     except StageFailure as failure:

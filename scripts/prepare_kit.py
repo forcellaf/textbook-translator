@@ -9,9 +9,9 @@ Stages, in order -- the order matters:
   1. normalize   merge split headings; report anything else short
   2. profile     one cached LLM call: glossary + a level per heading
   3. re-level    apply that classification (pure, no LLM)
-  4. tables      HTML -> pandoc pipe tables; warn and skip degenerate ones
+  4. tables      HTML -> pipe tables; warn and skip degenerate ones
   5. tokenize    image paths -> IMG_nnnn
-  6. chunk       ~50,000 chars on paragraph boundaries
+  6. chunk       ~30,000 chars on paragraph boundaries
 
 Normalizing before profiling is not optional: headings are matched by their
 exact text, so classifying ``## 第13章`` and then merging it into
@@ -28,6 +28,7 @@ from pathlib import Path
 
 from _bootstrap import configure_logging  # noqa: E402  (must precede src imports)
 
+from src.config import KIT_CHUNK_CHARS  # noqa: E402
 from src.kit import build_kit  # noqa: E402
 from src.normalize import normalize  # noqa: E402
 from src.profiler import apply_heading_levels, profile_book  # noqa: E402
@@ -44,7 +45,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("work_dir", type=Path, help="this book's data/work/<book_name>/ directory")
     parser.add_argument("--kit-dir", type=Path, default=None, help="default: <work-dir>/kit")
     parser.add_argument(
-        "--chunk-chars", type=int, default=None, help="chunk budget (default: KIT_CHUNK_CHARS)"
+        "--chunk-chars",
+        type=int,
+        default=None,
+        help=f"chunk budget in source characters (default: {KIT_CHUNK_CHARS:,})",
     )
     parser.add_argument(
         "--no-profile",
@@ -128,10 +132,14 @@ def main(argv: list[str] | None = None) -> int:
         **({"max_chars": args.chunk_chars} if args.chunk_chars else {}),
     )
 
-    print(f"\nkit: {kit.chunk_count} chunk(s), {len(kit.image_map)} image token(s) in {kit_dir}")
+    budget = args.chunk_chars or KIT_CHUNK_CHARS
+    print(
+        f"\nkit: {kit.chunk_count} chunk(s) of up to {budget:,} chars, "
+        f"{len(kit.image_map)} image token(s) in {kit_dir}"
+    )
     print(f"  paste {kit_dir / 'system_prompt.txt'} as the system prompt")
-    print(f"  send  {kit_dir / 'chunks'}/NNN.md one at a time")
-    print(f"  save each reply to {kit_dir / 'translated'}/NNN.md")
+    print(f"  send  {kit_dir / 'chunks'}/NNN.md one at a time, one fresh conversation each")
+    print(f"  save each reply (LaTeX) to {kit_dir / 'translated'}/NNN.tex")
     print(f"\nnext: python scripts/lint_translation.py {kit_dir}")
     return 0
 

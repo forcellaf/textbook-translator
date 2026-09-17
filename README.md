@@ -9,11 +9,15 @@ cached LLM call per book. There is no GPU step and no notebook.
 ```
 PDF ──parse──► merged.md ──prepare──► kit/chunks/*.md
                                            │
-                                    (you translate)
+                                (you translate, to LaTeX)
                                            │
                                            ▼
-PDF ◄──build── translated_book.md ◄─lint─ kit/translated/*.md
+PDF ◄──build── translated_book.tex ◄─lint─ kit/translated/*.tex
 ```
+
+The source chunks are Markdown, because that is what the parser produces. The
+replies are **LaTeX body fragments**, which the build wraps in
+[assets/preamble.tex](assets/preamble.tex) and compiles directly.
 
 ---
 
@@ -25,12 +29,11 @@ PDF ◄──build── translated_book.md ◄─lint─ kit/translated/*.md
 uv sync
 ```
 
-**2. Install pandoc + a LaTeX distribution.** This is the one dependency not
-installed through Python. Get pandoc from <https://pandoc.org/installing.html>
-and a TeX distribution that provides `xelatex` (TeX Live or MiKTeX).
+**2. Install a LaTeX distribution.** This is the one dependency not installed
+through Python: TeX Live or MiKTeX, providing `pdflatex`.
 
 ```bash
-pandoc --version && xelatex --version
+pdflatex --version
 ```
 
 **3. Create `.env`** in the project root:
@@ -63,15 +66,18 @@ data/work/<book_name>/
 ├── prepared.md         after re-levelling + tables
 ├── book_profile.json   cached LLM call: glossary + heading levels
 └── kit/
-    ├── chunks/001.md…      source chunks, image paths tokenised
-    ├── translated/001.md…  your saved replies (you fill this in)
+    ├── chunks/001.md…       source chunks, image paths tokenised
+    ├── translated/001.tex…  your saved replies (you fill this in)
     ├── images/
-    ├── image_map.json      IMG_nnnn → real filename
+    ├── image_map.json       IMG_nnnn → real filename
     ├── source_clean.md
     ├── system_prompt.txt
-    ├── translated_book.md  ← stage 4 assembles this
-    └── translated_book.pdf ← the deliverable
+    ├── translated_book.tex  ← stage 4 assembles this
+    └── translated_book.pdf  ← the deliverable
 ```
+
+`translated_book.tex` has to sit beside `images/`: the preamble's
+`\graphicspath` resolves figures relative to the `.tex`.
 
 `data/work/` is gitignored.
 
@@ -119,9 +125,9 @@ Six steps, in this order:
 1. **normalize** — merge split headings; report anything else short
 2. **profile** — one cached LLM call: glossary + a level per heading
 3. **re-level** — apply that classification (pure, no LLM)
-4. **tables** — HTML → pandoc pipe tables
+4. **tables** — HTML → markdown pipe tables
 5. **tokenize** — image paths → `IMG_nnnn`
-6. **chunk** — ~50,000 chars, on paragraph boundaries only
+6. **chunk** — ~30,000 chars, on paragraph boundaries only
 
 | Flag | Purpose |
 |---|---|
@@ -148,18 +154,27 @@ Six steps, in this order:
 classifier puts one heading at the wrong level, fix that line and re-run —
 the cached profile is reused, so no LLM call is repeated.
 
-**Then translate.** Paste `kit/system_prompt.txt` as the system prompt, send
-`kit/chunks/001.md` … one at a time, and save each reply as
-`kit/translated/<same-number>.md`.
+**Then translate.** Paste `kit/system_prompt.txt` as the system instruction,
+send `kit/chunks/001.md` … one at a time in a fresh conversation each, and save
+each reply as `kit/translated/<same-number>.tex`.
+
+`system_prompt.txt` is [assets/system_prompt_latex.txt](assets/system_prompt_latex.txt)
+with the book's context and glossary substituted into it. That file is meant to
+be edited: when the model gets something wrong repeatedly, tighten the rule it
+broke and re-run stage 2.
 
 Two constraints worth knowing:
 
 - Chunk size is bound by the model's **output** limit, not its context window —
-  it has to emit a full translation of everything you give it.
-- **Ask for Markdown, not LaTeX.** Requesting LaTeX directly was tried and
-  measured: invented environments that were never defined, image-hash
-  corruption, chunks silently returned untranslated. Markdown plus
-  deterministic pandoc conversion eliminated all of it.
+  it has to emit a full translation of everything you give it. Measured on the
+  reference book, output ran 1.33×–2.87× the input length (mean 2.29×), and the
+  longest reply hit 143,000 characters ≈ 36,000 tokens, occasionally coming back
+  truncated. LaTeX is more verbose again, so the budget is 30,000 source
+  characters: worst case ≈ 87,000 characters ≈ 22,000 tokens.
+- **The model writes body fragments only.** No `\documentclass`, no
+  `\usepackage`, no `\begin{document}` — the preamble is added once, at
+  assembly, because a preamble re-invented per conversation comes back
+  different every time and the book stops compiling.
 
 ## Stage 3 — Lint
 
@@ -168,9 +183,8 @@ uv run python scripts/lint_translation.py data/work/physics/kit
 ```
 
 **This is the stage that ends the debugging loop.** LaTeX reports one error per
-compile, against the generated `.tex` rather than your markdown — so four
-defects used to cost four full build cycles. Every check runs at once here,
-against the markdown, with line numbers and context.
+compile — so four defects used to cost four full build cycles. Every check runs
+at once here, with line numbers and context.
 
 Findings are split three ways:
 
@@ -178,23 +192,36 @@ Findings are split three ways:
 - **auto-fix** — provably safe. Apply with `--fix`.
 - **info** — context, not a problem.
 
-It checks, in one pass: CJK residue per chunk and overall, truncated chunks,
-image-token integrity, `$` run histogram, `$$` parity, inline `$` parity per
-paragraph, whitespace inside delimiters, brace balance in every math span,
-over-tabbed array rows, dangling argument commands (`\mathrm$`), unknown
-command tokens, unresolvable image paths, and heading-level distribution.
+Per chunk pair: CJK residue, truncation (both an absolute floor and an outlier
+against the book's own median expansion), and image-token integrity — every
+`IMG_nnnn` present, none invented.
 
-Two behaviours are deliberate:
+On the translated LaTeX: unbalanced and crossed environments, undefined
+environments, preamble leakage, brace balance, inline `$` parity per paragraph,
+duplicated numbering, dangling argument commands (`\mathrm$`), unknown command
+tokens, and figure paths that do not resolve on disk.
+
+**Every one of those LaTeX checks was a real failure during testing, and none
+of them is visible by reading the file** — the output looks correct and only
+fails at compile time, one error per compile. The undefined-environment check
+exists because the model invented `solution` and `theorem`; the numbering check
+because "12.1 12.1 Electric Charge" reads fine to a compiler.
+
+Three behaviours are deliberate:
 
 - **Unknown commands are reported, never auto-fixed.** On the reference book
   this flagged 41 tokens, of which 40 were real LaTeX simply missing from the
   known-commands list and 1 was the genuine defect. A checker with that hit
   rate must not edit. If a flagged command is real, add it to `KNOWN_COMMANDS`
   in [src/lint.py](src/lint.py).
-- **The only auto-fix is a known command literally doubled** (`\mathrmmathrm`
-  → `\mathrm`), which cannot be anything but damage.
+- **A doubled known command is auto-fixed** (`\mathrmmathrm` → `\mathrm`): it
+  cannot be anything but damage.
+- **So is a duplicated number** (`\section{12.1 Electric Charge}` →
+  `\section{Electric Charge}`): the pattern is unambiguous, and a title that
+  merely starts with a digit (`3D Charge Distributions`) is left alone.
 
-Lint one arbitrary file instead of a kit with `--markdown some.md`.
+Lint one file instead of a kit with `--tex one_chunk.tex` (a translated
+fragment) or `--markdown merged.md` (the parsed source).
 
 ## Stage 4 — Build
 
@@ -202,23 +229,35 @@ Lint one arbitrary file instead of a kit with `--markdown some.md`.
 uv run python scripts/build_pdf.py data/work/physics/kit
 ```
 
-Assembles the saved translations, restores the real image filenames from
-`image_map.json`, verifies every figure resolves on disk, re-lints, and runs
-pandoc.
+Lints the kit, concatenates the saved LaTeX replies, restores the real image
+filenames from `image_map.json`, wraps the result in
+[assets/preamble.tex](assets/preamble.tex), and runs `pdflatex` twice — the
+second pass is what fills in the table of contents.
 
 | Flag | Purpose |
 |---|---|
-| `-o PATH` | Output path (default `<kit>/translated_book.pdf`) |
 | `--no-lint` | Build even when findings need review |
-| `--cjk-font` | e.g. `'Noto Sans CJK SC'` — only if source text survives |
+| `--fix` | Apply the safe repairs to the assembled `.tex` first |
+| `--engine` | Default `pdflatex` (see below) |
 
 The lint gate is on by default. A broken figure or an untranslated chunk is far
 cheaper to fix now than to find in a 700-page PDF.
 
-The pandoc flags and [assets/header.tex](assets/header.tex) are a verified
-configuration — `-V classoption=openany` removes the blank verso before every
-chapter, and the header caps figure width (MinerU images carry no usable
-intrinsic size, so without it every figure renders wider than the text block).
+`pdflatex` is enough: the preamble uses `inputenc`, and a finished book has no
+Chinese left in it. If one does, `assets/preamble.tex` carries a commented
+two-line swap to `fontspec` + `xeCJK` — uncomment it and pass
+`--engine xelatex`.
+
+The preamble is a verified configuration, hand-maintained, and the
+specification rather than an output of the code: `openany` removes the blank
+verso before every chapter, `\bookfig` caps figure width (MinerU images carry
+no usable intrinsic size, so without it every figure renders wider than the
+text block), and `\setcounter{chapter}{11}` is what makes a volume starting at
+chapter 12 number its sections `12.1`, `12.2` … instead of `1.1`, `1.2`. Set
+that to (first chapter number − 1) for a different volume.
+
+A compile failure is printed as the error lines pulled out of the log, not the
+log itself, and the script exits non-zero.
 
 ---
 
@@ -242,7 +281,7 @@ All settings are environment variables, read in [src/config.py](src/config.py).
 | `MINERU_MODEL_VERSION` | `vlm` | `vlm` or `pipeline` |
 | `MINERU_LANGUAGE` | `ch` | OCR language hint |
 | `MINERU_TIMEOUT_MINUTES` | `120` | Poll timeout for a whole batch |
-| `KIT_CHUNK_CHARS` | `50000` | Chunk budget |
+| `KIT_CHUNK_CHARS` | `30000` | Chunk budget, in source characters |
 | `SOURCE_RESIDUE_THRESHOLD` | `0.04` | CJK fraction above which a chunk reads as untranslated |
 | `SPLIT_MAX_PAGES` | `190` | Per-part page target (API hard limit 200) |
 | `SPLIT_MAX_SIZE_MB` | `180` | Per-part size target (API hard limit 200) |
@@ -271,11 +310,11 @@ What genuinely still needs handling, and which stage handles it:
 |---|---|
 | Headings flat below level 2 (422 of 442 at `##`) | prepare → profile + re-level |
 | Split headings (`## 第13章` / `## 电势`) | prepare → normalize |
-| Tables emitted as raw HTML, which pandoc's LaTeX writer **discards** | prepare → tables |
+| Tables emitted as raw HTML, which the model reproduces as HTML | prepare → tables |
 | Model corrupting 64-char image hashes (~7.7%) | prepare → tokenize |
 
 Display math is still character-spaced. That is **cosmetic only** — with no
-delimiter-adjacent whitespace it causes no pandoc failure. Don't "fix" it.
+delimiter-adjacent whitespace it compiles correctly. Don't "fix" it.
 
 ---
 
@@ -291,12 +330,19 @@ are translated into actionable messages: `A0202` bad token, `A0211` expired,
 **Upload times out** — MinerU's storage is Aliyun OSS. Set `HTTP_PROXY` /
 `HTTPS_PROXY`, or raise `MINERU_UPLOAD_TIMEOUT_SECONDS`.
 
-**`pandoc exited 43`** — the last 3000 characters of its log are printed, which
-is where LaTeX reports the actual error. Run the lint stage first; it finds
-nearly all of these against the markdown instead.
+**`pdflatex failed on pass 1/2`** — the error lines from the log are printed,
+which is where LaTeX names the actual problem. Run the lint stage first; it
+finds nearly all of these, all at once, before the first compile.
 
-**Tables missing from the PDF** — check the prepare output for tables left as
-HTML. Pandoc's LaTeX writer discards raw HTML blocks silently.
+**`Environment solution undefined`** — the model invented an environment. Lint
+reports these by name and line; only the list in
+[src/latex.py](src/latex.py)`::DEFINED_ENVIRONMENTS` exists.
+
+**A number appears twice** ("12.1 12.1 Electric Charge") — the model kept a
+source number LaTeX generates itself. `--fix` strips it.
+
+**Tables missing or mangled in the PDF** — check the prepare output for tables
+left as HTML; merged cells are reported, not guessed at.
 
 **A chunk came back untranslated** — lint catches it by CJK density, because an
 untranslated chunk is *full length* and correctly formatted. Re-send that chunk.
@@ -321,10 +367,11 @@ nothing repairs them any more.
 | [src/mineru_api.py](src/mineru_api.py) | Cloud API: split, upload, poll, merge |
 | [src/normalize.py](src/normalize.py) | Split-heading repair + diagnostics |
 | [src/tables.py](src/tables.py) | HTML tables → pipe tables |
+| [src/latex.py](src/latex.py) | Preamble + prompt assets, fragment scanning, assembly |
 | [src/profiler.py](src/profiler.py) | Cached per-book LLM call: glossary + heading levels |
 | [src/kit.py](src/kit.py) | Tokenising, chunking, assembly, packaging |
 | [src/lint.py](src/lint.py) | Every check, in one pass |
-| [src/build.py](src/build.py) | pandoc / XeLaTeX invocation |
+| [src/build.py](src/build.py) | `pdflatex` invocation |
 | [src/splitter.py](src/splitter.py) | PDF page-range splitting |
 
 There is also a fully automated path, `uv run python -m src.main <pdf>`, which

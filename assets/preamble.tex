@@ -1,0 +1,113 @@
+% ============================================================
+%  Translated textbook preamble
+%  Based on the template used for last semester's translation,
+%  updated for real extracted figures (previously placeholders).
+% ============================================================
+
+\documentclass[11pt,a4paper,openany]{book}
+% openany: chapters may start on either page. Without it, `book` forces
+% every chapter onto a recto page and inserts a blank verso before it.
+
+% ---------------------------------------------------------
+% PACKAGES
+% ---------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\geometry{left=2.5cm, right=2.5cm, top=3cm, bottom=3cm}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage{longtable}   % tables that run past one page
+\usepackage{array}
+\usepackage{graphicx}    % required for real figures
+\usepackage{float}
+\usepackage[hidelinks]{hyperref}
+
+% If any source-language characters survive translation, pdfLaTeX will fail on
+% them. Swap the two lines below and compile with XeLaTeX instead:
+%   \usepackage{fontspec}
+%   \usepackage{xeCJK}\setCJKmainfont{Noto Sans CJK SC}
+
+% ---------------------------------------------------------
+% FORMATTING & STYLING
+% ---------------------------------------------------------
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{20pt}{\Huge}
+\titleformat{\section}
+  {\normalfont\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}
+  {\normalfont\large\bfseries}{\thesubsection}{1em}{}
+
+% Captions deliberately unlike body text, so they are easy to pick out:
+% smaller, italic, with a bold "Figure 12.3." label.
+\captionsetup{
+  font={small,it},
+  labelfont={small,bf,up},
+  labelsep=period,
+  justification=centering,
+  skip=6pt
+}
+
+% Equation spacing -- the default is tight against surrounding prose.
+\setlength{\abovedisplayskip}{10pt}
+\setlength{\belowdisplayskip}{10pt}
+\setlength{\abovedisplayshortskip}{6pt}
+\setlength{\belowdisplayshortskip}{6pt}
+
+% Where extracted figures live, relative to the .tex file.
+\graphicspath{{images/}{./}}
+
+% ---------------------------------------------------------
+% CUSTOM ENVIRONMENTS
+% ---------------------------------------------------------
+\newtheorem{example}{Example}[chapter]
+\newtheorem{exercise}{Problem}[chapter]
+
+% ---------------------------------------------------------
+% CUSTOM COMMANDS
+% ---------------------------------------------------------
+% Standard figure. Every figure in the book goes through this, so they are
+% all centred, all the same width, and all captioned the same way.
+%
+%   \bookfig{IMG_0042}{Charge distribution inside a proton}
+%   \bookfig[0.85]{IMG_0107}{A wider diagram}
+%
+\newcommand{\bookfig}[3][0.6]{%
+  \begin{figure}[htbp]
+    \centering
+    \includegraphics[width=#1\textwidth,keepaspectratio]{#2}
+    \caption{#3}
+  \end{figure}%
+}
+
+% Two figures side by side, e.g. a source diagram split into (a) and (b).
+%
+%   \bookfigtwo{IMG_0001}{(a)}{IMG_0002}{(b)}{Overall caption}
+%
+\newcommand{\bookfigtwo}[5]{%
+  \begin{figure}[htbp]
+    \centering
+    \begin{minipage}{0.45\textwidth}
+      \centering\includegraphics[width=\textwidth,keepaspectratio]{#1}\\[2pt]{\small #2}
+    \end{minipage}\hfill
+    \begin{minipage}{0.45\textwidth}
+      \centering\includegraphics[width=\textwidth,keepaspectratio]{#3}\\[2pt]{\small #4}
+    \end{minipage}
+    \caption{#5}
+  \end{figure}%
+}
+
+% ---------------------------------------------------------
+\begin{document}
+\frontmatter
+\tableofcontents
+\mainmatter
+
+% This volume begins at chapter 12, but \chapter counts from 1. Without this
+% the first chapter is numbered 1 and its sections come out as 1.1, 1.2 ...
+% instead of 12.1, 12.2 -- which then disagrees with every cross-reference in
+% the prose. Set this to (first chapter number - 1).
+\setcounter{chapter}{11}

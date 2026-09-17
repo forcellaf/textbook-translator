@@ -4,17 +4,21 @@ The round-trip test is the important one. MinerU names images by a
 64-character content hash, and the translating model corrupted those at a
 measured 7.7% -- roughly 45 broken figures across 578 images, each silent
 until the PDF build. Tokenising is what makes that failure detectable, so the
-round trip has to be exact.
+round trip has to be exact -- including through the LaTeX form the tokens
+come back in, ``\\bookfig{IMG_0042}{caption}``.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from src.config import KIT_CHUNK_CHARS
 from src.kit import (
     ASSEMBLED_NAME,
     assemble,
@@ -26,6 +30,7 @@ from src.kit import (
     tokenize_images,
     verify_images,
 )
+from src.profiler import BookProfile
 
 HASH_A = "6a4664edf518e3474010602a246bff85109b125b602b19133d3bf76d48010c6d.jpg"
 HASH_B = "ce7af3353cafb1af097e9398bdbd331c09d518d8a1d5817e6cf1cf8bca4d1732.jpg"
@@ -48,6 +53,25 @@ def test_tokenise_restore_round_trip_preserves_every_path_exactly() -> None:
     restored, unknown = restore_images(tokenized, mapping)
     assert restored == text
     assert unknown == []
+
+
+def test_the_round_trip_survives_the_translation_into_latex() -> None:
+    """The real path: a token goes out in markdown image syntax and comes
+    back as a \\bookfig argument. Restoration has to find it there."""
+    source = f"![图 12.3 电场分布](images/{HASH_A})\n\n![](images/{HASH_B})\n"
+    tokenized, mapping = tokenize_images(source)
+
+    translated = (
+        "\\bookfig{IMG_0000}{Field distribution}\n\n"
+        "\\bookfigtwo{IMG_0000}{(a)}{IMG_0001}{(b)}{Both halves}\n\n"
+        "\\includegraphics[width=0.5\\textwidth]{IMG_0001}\n"
+    )
+    restored, unknown = restore_images(translated, mapping)
+
+    assert unknown == []
+    assert "IMG_" not in restored
+    assert restored.count(f"images/{HASH_A}") == 2
+    assert restored.count(f"images/{HASH_B}") == 2
 
 
 def test_a_repeated_path_reuses_one_token() -> None:
@@ -163,6 +187,36 @@ def test_build_kit_writes_every_expected_artifact(tmp_path: Path) -> None:
     assert sorted(mapping) == ["IMG_0000", "IMG_0001"]
 
 
+def test_the_kit_system_prompt_is_the_asset_with_the_glossary_folded_in(
+    tmp_path: Path,
+) -> None:
+    """What the user pastes into AI Studio is the tracked prompt asset, not
+    something assembled from string literals in the code."""
+    build_kit(
+        "# Chapter\n\nBody.\n",
+        tmp_path / "kit",
+        profile=BookProfile(subject="physics", glossary=(("电荷", "electric charge"),)),
+    )
+
+    prompt = (tmp_path / "kit" / "system_prompt.txt").read_text(encoding="utf-8")
+
+    assert "\\bookfig{IMG_0042}" in prompt  # straight from the asset
+    assert "电荷 -> electric charge" in prompt
+    assert "{{BOOK_CONTEXT_AND_GLOSSARY}}" not in prompt
+
+
+def test_the_default_chunk_budget_is_the_configured_one(tmp_path: Path) -> None:
+    """30,000 source characters: the measured worst-case expansion (2.87x)
+    on a LaTeX-emitting run has to stay inside the model's output limit."""
+    assert KIT_CHUNK_CHARS == 30_000
+
+    paragraphs = "\n\n".join("x" * 5_000 for _ in range(12))
+    build_kit(paragraphs, tmp_path / "kit")
+
+    for chunk in (tmp_path / "kit" / "chunks").glob("*.md"):
+        assert len(chunk.read_text(encoding="utf-8")) <= KIT_CHUNK_CHARS
+
+
 def test_rebuilding_a_kit_does_not_leave_stale_chunks(tmp_path: Path) -> None:
     kit = _seed_kit(tmp_path)
     (kit / "chunks" / "099.md").write_text("stale", encoding="utf-8")
@@ -172,38 +226,47 @@ def test_rebuilding_a_kit_does_not_leave_stale_chunks(tmp_path: Path) -> None:
     assert [p.name for p in (kit / "chunks").glob("*.md")] == ["001.md"]
 
 
-def test_assemble_restores_real_paths_and_reports_missing_translations(
-    tmp_path: Path,
-) -> None:
-    kit = _seed_kit(tmp_path)
-    for chunk in sorted((kit / "chunks").glob("*.md")):
-        (kit / "translated" / chunk.name).write_text(
-            chunk.read_text(encoding="utf-8"), encoding="utf-8"
+def _translate(kit: Path, wrap: Callable[[str], str] = lambda body: body) -> None:
+    """Save a plausible LaTeX reply for every chunk, keeping its tokens."""
+    for index, chunk in enumerate(sorted((kit / "chunks").glob("*.md")), start=1):
+        tokens = re.findall(r"IMG_\d{4}", chunk.read_text(encoding="utf-8"))
+        parts = [f"\\section{{Part {index}}}"]
+        parts += [f"\\bookfig{{{token}}}{{Figure {index}}}" for token in tokens]
+        (kit / "translated" / f"{chunk.stem}.tex").write_text(
+            wrap("\n\n".join(parts)), encoding="utf-8"
         )
 
+
+def test_assemble_restores_real_paths_and_wraps_the_preamble(tmp_path: Path) -> None:
+    kit = _seed_kit(tmp_path)
+    _translate(kit)
+
     assembled, problems = assemble(kit)
-    body = assembled.read_text(encoding="utf-8")
+    tex = assembled.read_text(encoding="utf-8")
 
     assert problems == []
-    assert HASH_A in body and HASH_B in body
-    assert "IMG_0000" not in body
-    assert assembled.name == ASSEMBLED_NAME
+    assert HASH_A in tex and HASH_B in tex
+    assert "IMG_0000" not in tex
+    assert assembled.name == ASSEMBLED_NAME == "translated_book.tex"
+    # Compilable as it stands, and sitting next to images/ as \graphicspath
+    # expects.
+    assert tex.count("\\begin{document}") == 1
+    assert tex.count("\\end{document}") == 1
+    assert (assembled.parent / "images").is_dir()
 
 
 def test_assemble_reports_a_chunk_with_no_translation_saved(tmp_path: Path) -> None:
     kit = _seed_kit(tmp_path)
-    (kit / "translated" / "001.md").write_text("translated one", encoding="utf-8")
+    (kit / "translated" / "001.tex").write_text("\\section{One}", encoding="utf-8")
 
     _, problems = assemble(kit)
     assert any("002" in p for p in problems)
 
 
-def test_assemble_strips_a_wrapping_code_fence(tmp_path: Path) -> None:
+def test_assemble_strips_a_wrapping_latex_fence(tmp_path: Path) -> None:
+    """AI Studio wraps the reply in ```latex regardless of the prompt."""
     kit = _seed_kit(tmp_path)
-    for chunk in sorted((kit / "chunks").glob("*.md")):
-        (kit / "translated" / chunk.name).write_text(
-            f"```markdown\n{chunk.read_text(encoding='utf-8')}\n```", encoding="utf-8"
-        )
+    _translate(kit, wrap=lambda body: f"```latex\n{body}\n```")
 
     assembled, _ = assemble(kit)
     assert "```" not in assembled.read_text(encoding="utf-8")
@@ -217,6 +280,28 @@ def test_verify_images_finds_a_reference_with_no_file(tmp_path: Path) -> None:
     missing = verify_images(f"![a](images/{HASH_A})\n\n![b](images/nope.jpg)\n", kit)
 
     assert missing == ["images/nope.jpg"]
+
+
+def test_verify_images_checks_bookfig_references_too(tmp_path: Path) -> None:
+    """After assembly the references are LaTeX, not markdown."""
+    kit = _seed_kit(tmp_path)
+    text = (
+        f"\\bookfig{{images/{HASH_A}}}{{There}}\n\n"
+        "\\bookfig[0.9]{images/gone.jpg}{Not there}\n"
+    )
+
+    assert verify_images(text, kit) == ["images/gone.jpg"]
+
+
+def test_the_preambles_own_macro_definition_is_not_a_missing_figure(
+    tmp_path: Path,
+) -> None:
+    """\\bookfig is defined as \\includegraphics{#2}; `#2` is not a path."""
+    kit = _seed_kit(tmp_path)
+    _translate(kit)
+    assembled, _ = assemble(kit)
+
+    assert verify_images(assembled.read_text(encoding="utf-8"), kit) == []
 
 
 def test_missing_kit_images_checks_the_map_not_the_tokenised_source(tmp_path: Path) -> None:

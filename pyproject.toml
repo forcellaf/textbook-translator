@@ -22,8 +22,9 @@ dependencies = [
 # declared explicitly now because `src.splitter` and `src.mineru_api` import
 # them directly.
 #
-# pandoc is the one dependency this project does NOT install through Python.
-# Install it separately: https://pandoc.org/installing.html
+# A LaTeX distribution (TeX Live or MiKTeX, providing `pdflatex`) is the one
+# dependency this project does NOT install through Python. The build shells
+# out to it; see src/build.py.
 
 [build-system]
 requires = ["uv_build>=0.12.2,<0.13.0"]

@@ -1,30 +1,41 @@
 """
-Every markdown defect in one pass.
+Every defect in one pass, on both sides of the translation.
 
 Why this module exists
 ----------------------
-LaTeX reports one error per compile, against the *generated* ``.tex`` rather
-than the markdown you wrote. Finding four defects in an 840,000-character
-book therefore cost four full build cycles, each one a hunt for the markdown
-line that produced a line number in a file nobody edits. This runs every
-check at once, against the markdown, with line numbers and context -- so the
-whole list is on screen before the first build.
+LaTeX reports one error per compile. Finding four defects in an
+840,000-character book therefore cost four full build cycles, each one
+starting from a line number in a file the size of a phone book. This runs
+every check at once, with line numbers and context, so the whole list is on
+screen before the first build.
 
-Historical checks are kept on purpose
---------------------------------------
-Several checks here (delimiter whitespace, welded ``$$$$``, escaped ``\\$``,
-space-mangled LaTeX, over-tabbed arrays) find **zero** defects in the current
-cloud VLM output. They stay because they are nearly free and a future parser
-change could reintroduce any of them silently. They are diagnostics; there
-are deliberately no normalizer passes behind them.
+Two surfaces, two entry points
+------------------------------
+``lint_markdown`` checks the **source**: MinerU's output, which the model is
+about to read. ``lint_latex`` checks the **translation**: the LaTeX the model
+sent back, which has to compile. ``lint_kit`` runs the chunk-pair checks and
+then hands the assembled translation to ``lint_latex``.
+
+Every LaTeX check here exists because it was a real failure during testing,
+and none of them is visible without an explicit check: the output looks
+correct and only fails at compile time.
+
+Historical source checks are kept on purpose
+--------------------------------------------
+Several markdown checks (delimiter whitespace, welded ``$$$$``, escaped
+``\\$``, over-tabbed arrays) find **zero** defects in the current cloud VLM
+output. They stay because they are nearly free and a future parser change
+could reintroduce any of them silently. They are diagnostics; there are
+deliberately no normalizer passes behind them.
 
 Report, never guess
 -------------------
 The unknown-command check flagged 41 tokens on the test book. Forty were real
 LaTeX simply missing from ``KNOWN_COMMANDS`` below; exactly one was the
-genuine defect. A checker with that hit rate must report, never auto-fix. The
-single exception is a known command literally doubled (``\\mathrmmathrm`` ->
-``\\mathrm``), which cannot be anything but damage.
+genuine defect. A checker with that hit rate must report, never auto-fix.
+Only two repairs are unambiguous enough to apply: a known command literally
+doubled (``\\mathrmmathrm`` -> ``\\mathrm``), and a source number the model
+repeated into a heading or caption that LaTeX numbers itself.
 """
 
 from __future__ import annotations
@@ -37,9 +48,15 @@ from enum import Enum
 from pathlib import Path
 
 from src.config import SOURCE_RESIDUE_THRESHOLD
+from src.latex import (
+    DEFINED_ENVIRONMENTS,
+    brace_imbalance,
+    find_preamble_leakage,
+    scan_environments,
+)
 from src.normalize import (
     HEADING_RE,
-    INLINE_MATH_RE,
+    MathSpan,
     display_parity,
     dollar_run_histogram,
     iter_math_spans,
@@ -169,6 +186,7 @@ underset color textcolor mbox hbox
 _COMMAND_RE = re.compile(r"\\([A-Za-z]+)")
 _DOUBLED_COMMAND_RE = re.compile(r"\\([A-Za-z]+?)\1(?![A-Za-z])")
 _ARRAY_RE = re.compile(r"\\begin\{(array|tabular)\}\s*\{([^}]*)\}(.*?)\\end\{\1\}", re.DOTALL)
+_TAG_RE = re.compile(r"\\tag\s*\*?\s*\{([^}]*)\}")
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)")
 _HTML_IMAGE_RE = re.compile(r'<img\b[^>]*\bsrc="([^"]+)"', re.IGNORECASE)
 _UNESCAPED_DOLLAR_RE = re.compile(r"(?<!\\)\$")
@@ -176,6 +194,51 @@ _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
 
 IMG_TOKEN_RE = re.compile(r"IMG_(\d{4})")
 _MATH_STRIP_RE = re.compile(r"\$\$.*?\$\$|\$[^$\n]+\$", re.DOTALL)
+
+# Source chunks are Markdown (that is what MinerU produces); the replies
+# saved against them are LaTeX, and are named for the chunk they answer:
+# chunks/007.md -> translated/007.tex.
+TRANSLATED_SUFFIX = ".tex"
+
+# ── LaTeX-side patterns ─────────────────────────────────────────────────────
+
+# Math delimiters the dollar-based scanner in src.normalize does not know
+# about. The translated book uses \[...\] for unnumbered display math and
+# equation/align for numbered, so the math checks would otherwise see only a
+# fraction of the mathematics in it.
+_BRACKET_MATH_RE = re.compile(r"\\\[(.*?)\\\]", re.DOTALL)
+_MATH_ENV_RE = re.compile(
+    r"\\begin\{(equation|align|gather|multline|eqnarray|displaymath)\*?\}"
+    r"(.*?)\\end\{\1\*?\}",
+    re.DOTALL,
+)
+
+# Sectioning and caption commands whose argument LaTeX numbers by itself.
+_NUMBERED_ARG_RE = re.compile(
+    r"\\(chapter|section|subsection|subsubsection|caption)\*?(?:\[[^\]]*\])?\{"
+)
+
+# A source number (or a "Figure"/"Table" label) the model copied into an
+# argument LaTeX numbers itself, producing "12.1 12.1 Electric Charge". The
+# trailing `\s+(?=\S)` is what keeps this unambiguous: it never fires on a
+# title that merely starts with a digit ("3D Printing"), on a bare
+# "\caption{Figure 12.3}" with nothing after the label, or on prose beginning
+# with an unnumbered "Figure".
+_LEADING_NUMBER_RE = re.compile(
+    r"\A(?:(?:Figure|Fig\.|Table|Tab\.)\s*)?\d+(?:\.\d+)*\.?\s+(?=\S)",
+    re.IGNORECASE,
+)
+
+# A LaTeX comment: an unescaped `%` to the end of the line.
+_COMMENT_RE = re.compile(r"(?<!\\)%[^\n]*")
+
+# Figure references in translated LaTeX: the \bookfig / \bookfigtwo macros
+# from assets/preamble.tex, plus a raw \includegraphics if the model used one.
+_TEX_IMAGE_RES: tuple[tuple[re.Pattern[str], tuple[int, ...]], ...] = (
+    (re.compile(r"\\includegraphics(?:\[[^\]]*\])?\s*\{([^{}]*)\}"), (1,)),
+    (re.compile(r"\\bookfig(?:\[[^\]]*\])?\s*\{([^{}]*)\}"), (1,)),
+    (re.compile(r"\\bookfigtwo\s*\{([^{}]*)\}\s*\{[^{}]*\}\s*\{([^{}]*)\}"), (1, 2)),
+)
 
 # Truncation floor for a single chunk judged alone: a translation under 40%
 # of its source's length. Deliberately lenient, because the source is CJK and
@@ -217,25 +280,6 @@ def cjk_ratio(text: str) -> float:
     return sum(1 for c in chars if "\u4e00" <= c <= "\u9fff") / len(chars)
 
 
-def brace_imbalance(text: str) -> int:
-    """Net brace depth, ignoring escaped ``\\{`` and ``\\}``.
-
-    Returns the closing surplus as a negative number when the text dips
-    below depth 0 at any point, so ``}{`` is reported even though it nets to
-    zero.
-    """
-    cleaned = re.sub(r"\\[{}]", "", text)
-    depth = 0
-    low = 0
-    for char in cleaned:
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            low = min(low, depth)
-    return depth if depth else low
-
-
 # ── Markdown checks ─────────────────────────────────────────────────────────
 
 
@@ -254,8 +298,8 @@ def _check_dollar_runs(text: str) -> list[Finding]:
             Finding(
                 "welded-delimiters",
                 Severity.REVIEW,
-                f"welded `$` runs longer than `$$`: {welded}. Pandoc pairs these "
-                "wrongly and swallows the surrounding text as math.",
+                f"welded `$` runs longer than `$$`: {welded}. The delimiters pair "
+                "up wrongly from there on, swallowing prose into mathematics.",
             )
         )
     return findings
@@ -270,7 +314,7 @@ def _check_display_parity(text: str) -> list[Finding]:
             "display-parity",
             Severity.REVIEW,
             f"{count} `$$` delimiters -- odd, so a display block is never closed "
-            "and pandoc reads the rest of the document as mathematics.",
+            "and everything after it reads as mathematics.",
         )
     ]
 
@@ -314,8 +358,8 @@ def _check_delimiter_whitespace(text: str) -> list[Finding]:
         Finding(
             "delimiter-whitespace",
             Severity.REVIEW,
-            "whitespace inside inline `$` delimiters; pandoc will not read this "
-            "as math and the LaTeX leaks into text mode",
+            "whitespace inside inline `$` delimiters; this does not read as "
+            "math, so the LaTeX inside it leaks into text mode",
             span.line,
             _excerpt(span.body),
         )
@@ -352,6 +396,37 @@ def _check_braces(text: str) -> list[Finding]:
                     "brace-balance",
                     Severity.REVIEW,
                     f"{span.kind} math span has unbalanced braces ({sign})",
+                    span.line,
+                    _excerpt(span.body),
+                )
+            )
+    return findings[:_MAX_EXAMPLES]
+
+
+def _check_multiple_tags(text: str) -> list[Finding]:
+    """Math spans carrying more than one ``\\tag``.
+
+    amsmath hard-errors on this -- "! Package amsmath Error: Multiple \\tag."
+    -- so the document cannot compile at all. Seen once on a real book, where
+    the parser read a stray number in the scan margin as a second tag and
+    emitted ``\\tag {30}\\tag{30.12}``.
+
+    Reported, never auto-fixed: the equation is guaranteed broken, but
+    deciding *which* tag is the real equation number means looking at the
+    book. Both are listed so that takes seconds.
+    """
+    findings: list[Finding] = []
+    for span in iter_math_spans(text):
+        tags = _TAG_RE.findall(span.body)
+        if len(tags) > 1:
+            findings.append(
+                Finding(
+                    "multiple-tags",
+                    Severity.REVIEW,
+                    f"{span.kind} math span carries {len(tags)} \\tag commands "
+                    f"({', '.join(repr(t) for t in tags)}); amsmath allows one, so "
+                    "the build fails outright. Delete whichever is not the real "
+                    "equation number.",
                     span.line,
                     _excerpt(span.body),
                 )
@@ -506,8 +581,8 @@ def _check_headings(text: str) -> list[Finding]:
                 "heading-levels",
                 Severity.REVIEW,
                 f"{count} of {total} headings sit at level {level}; the outline is "
-                "flat, so pandoc renders chapters, sections and examples at "
-                "identical weight. Run the profiler's heading classification.",
+                "flat, so the model has nothing to tell a chapter, a section and a "
+                "worked example apart. Run the profiler's heading classification.",
             )
         )
     return findings
@@ -549,8 +624,294 @@ def _check_image_paths(text: str, base_dir: Path | None) -> list[Finding]:
     ]
 
 
+# ── LaTeX checks ────────────────────────────────────────────────────────────
+#
+# Each of these fired on real translated output during testing. They exist
+# because none of the defects is visible by reading the file: it looks like
+# perfectly ordinary LaTeX and only fails at compile time, one error per
+# compile.
+
+
+def iter_latex_math_spans(text: str):
+    """Every math span in translated LaTeX, dollars and environments alike.
+
+    ``src.normalize.iter_math_spans`` only knows ``$...$`` and ``$$...$$``,
+    which is all the *source* markdown contains. The translation also uses
+    ``\\[...\\]`` and equation/align environments, and the math checks would
+    quietly skip those.
+    """
+    yield from iter_math_spans(text)
+    for pattern, body_group in ((_BRACKET_MATH_RE, 1), (_MATH_ENV_RE, 2)):
+        for match in pattern.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            yield MathSpan(line, "display", match.group(body_group))
+
+
+def _check_environments(text: str) -> list[Finding]:
+    """Unbalanced, crossed and undefined environments.
+
+    Undefined ones are the expensive kind: during testing the model invented
+    ``solution`` and ``theorem``, and an environment the preamble never
+    defines stops the build dead.
+    """
+    findings = [
+        Finding(
+            "undefined-environment" if issue.kind == "undefined" else "environment-balance",
+            Severity.REVIEW,
+            issue.message,
+            issue.line,
+        )
+        for issue in scan_environments(text)
+    ]
+    if findings:
+        return findings[:_MAX_EXAMPLES]
+    return [
+        Finding(
+            "environment-balance",
+            Severity.INFO,
+            f"every \\begin has a matching \\end, from the {len(DEFINED_ENVIRONMENTS)} "
+            "defined environments",
+        )
+    ]
+
+
+def _check_preamble_leakage(text: str) -> list[Finding]:
+    """Preamble commands inside a body fragment.
+
+    The preamble is added once, at assembly. A stray ``\\end{document}``
+    halfway through ends the book there and silently drops the rest.
+    """
+    return [
+        Finding(
+            "preamble-leakage",
+            Severity.REVIEW,
+            f"{command} must not appear in translated body text; the preamble is "
+            "added once, at assembly",
+            line,
+        )
+        for line, command in find_preamble_leakage(text)[:_MAX_EXAMPLES]
+    ]
+
+
+def _check_latex_braces(text: str) -> list[Finding]:
+    """Brace balance, per paragraph so the report carries a line number."""
+    findings: list[Finding] = []
+    offset = 1
+    for paragraph in _PARAGRAPH_SPLIT_RE.split(text):
+        imbalance = brace_imbalance(paragraph)
+        if imbalance:
+            detail = (
+                f"{imbalance} unclosed '{{'"
+                if imbalance > 0
+                else f"{-imbalance} closing '}}' with no matching '{{'"
+            )
+            findings.append(
+                Finding(
+                    "brace-balance",
+                    Severity.REVIEW,
+                    f"paragraph has unbalanced braces ({detail})",
+                    offset,
+                    _excerpt(paragraph),
+                )
+            )
+        offset += paragraph.count("\n") + 2
+    return findings[:_MAX_EXAMPLES]
+
+
+def _braced_argument(text: str, open_index: int) -> tuple[str, int] | None:
+    """The content of the group starting at ``text[open_index] == '{'``.
+
+    Brace-matched rather than regex-matched, because these arguments
+    routinely contain nested groups: ``\\caption{Field of $E_{x}$}``.
+    """
+    depth = 0
+    i = open_index
+    length = len(text)
+    while i < length:
+        char = text[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1 : i], i + 1
+        i += 1
+    return None
+
+
+def _iter_numbered_arguments(text: str):
+    """``(command, argument, start, end, line)`` for each sectioning/caption
+    argument LaTeX numbers by itself."""
+    for match in _NUMBERED_ARG_RE.finditer(text):
+        found = _braced_argument(text, match.end() - 1)
+        if found is None:
+            continue
+        argument, end = found
+        line = text.count("\n", 0, match.start()) + 1
+        yield match.group(1), argument, match.end() - 1, end, line
+
+
+def _check_duplicated_numbers(text: str) -> list[Finding]:
+    """Source numbers copied into arguments LaTeX numbers itself.
+
+    The system prompt tells the model to strip them, and it mostly does.
+    What survives comes out as "12.1 12.1 Electric Charge" or
+    "Figure 12.3. Figure 12.3 Field distribution" in the PDF -- readable, so
+    nothing fails, which is exactly why it has to be checked.
+
+    Auto-fixable: the pattern is unambiguous, and the repair is to delete the
+    number.
+    """
+    findings: list[Finding] = []
+    for command, argument, _start, _end, line in _iter_numbered_arguments(text):
+        match = _LEADING_NUMBER_RE.match(argument)
+        if not match:
+            continue
+        findings.append(
+            Finding(
+                "duplicated-number",
+                Severity.AUTO_FIX,
+                f"\\{command} repeats the source number {match.group().strip()!r}; "
+                "LaTeX numbers it, so the PDF shows the number twice",
+                line,
+                _excerpt(f"\\{command}{{{argument}}}"),
+            )
+        )
+    return findings
+
+
+def _check_latex_dangling_commands(text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    for span in iter_latex_math_spans(text):
+        trailing = re.search(r"\\([A-Za-z]+)\s*$", span.body)
+        if trailing and trailing.group(1) in _ARGUMENT_COMMANDS:
+            findings.append(
+                Finding(
+                    "dangling-command",
+                    Severity.REVIEW,
+                    f"\\{trailing.group(1)} ends the {span.kind} math span with no "
+                    "argument -- '! Missing } inserted.'",
+                    span.line,
+                    _excerpt(span.body),
+                )
+            )
+    return findings[:_MAX_EXAMPLES]
+
+
+def _check_latex_unknown_commands(text: str) -> list[Finding]:
+    """Report-only, for the reason in the module docstring: 40 of the 41
+    tokens this flagged on the test book were legitimate."""
+    seen: dict[str, tuple[int, str]] = {}
+    counts: dict[str, int] = {}
+    for span in iter_latex_math_spans(text):
+        for match in _COMMAND_RE.finditer(span.body):
+            name = match.group(1)
+            if name in KNOWN_COMMANDS:
+                continue
+            counts[name] = counts.get(name, 0) + 1
+            seen.setdefault(name, (span.line, _excerpt(span.body)))
+
+    if not counts:
+        return [Finding("unknown-command", Severity.INFO, "no unrecognized math commands")]
+
+    ordered = sorted(counts.items(), key=lambda kv: kv[1])
+    return [
+        Finding(
+            "unknown-command",
+            Severity.REVIEW,
+            f"\\{name} appears {count}x in math and is not in KNOWN_COMMANDS -- "
+            "check it is real LaTeX, then add it to the list",
+            seen[name][0],
+            seen[name][1],
+        )
+        for name, count in ordered[:_MAX_EXAMPLES]
+    ]
+
+
+def latex_image_refs(text: str) -> list[str]:
+    """Every figure path referenced by the translated LaTeX, in order.
+
+    Two things in an assembled document are not figure references, and both
+    are in ``assets/preamble.tex``: the ``\\bookfig`` definition itself, which
+    is ``\\includegraphics{#2}``, and the worked examples in the comments
+    above it, which reference ``IMG_0042``.
+    """
+    without_comments = _COMMENT_RE.sub("", text)
+    refs: list[tuple[int, str]] = []
+    for pattern, groups in _TEX_IMAGE_RES:
+        for match in pattern.finditer(without_comments):
+            refs.extend((match.start(), match.group(group).strip()) for group in groups)
+    return [ref for _, ref in sorted(refs) if ref and "#" not in ref]
+
+
+def _check_latex_image_paths(text: str, base_dir: Path | None) -> list[Finding]:
+    refs = latex_image_refs(text)
+    if not refs:
+        return [Finding("image-paths", Severity.INFO, "no figure references")]
+    if base_dir is None:
+        return [
+            Finding(
+                "image-paths",
+                Severity.INFO,
+                f"{len(refs)} figure reference(s); no base directory given, so none "
+                "were resolved on disk",
+            )
+        ]
+
+    missing = [ref for ref in dict.fromkeys(refs) if not _resolves(ref, base_dir)]
+    if not missing:
+        return [
+            Finding("image-paths", Severity.INFO, f"all {len(set(refs))} figure path(s) resolve")
+        ]
+    return [
+        Finding(
+            "image-paths",
+            Severity.REVIEW,
+            f"{len(missing)} figure path(s) do not resolve under {base_dir}",
+            context=", ".join(missing[:5]),
+        )
+    ]
+
+
+def _resolves(ref: str, base_dir: Path) -> bool:
+    if ref.startswith(("http://", "https://", "data:")):
+        return True
+    return (base_dir / ref).exists() or (base_dir / "images" / Path(ref).name).exists()
+
+
+def lint_latex(text: str, *, base_dir: Path | None = None) -> LintReport:
+    """Run every check that applies to translated LaTeX body text.
+
+    Args:
+        text: The concatenated translation, with real image paths restored.
+            Body content only -- the preamble is added at assembly, and
+            passing a wrapped document here would report its own
+            ``\\documentclass`` as leakage.
+        base_dir: Directory figure paths resolve against. Omit to skip the
+            on-disk check.
+    """
+    findings: list[Finding] = []
+    findings += _check_environments(text)
+    findings += _check_preamble_leakage(text)
+    findings += _check_latex_braces(text)
+    findings += _check_inline_parity(text)
+    findings += _check_duplicated_numbers(text)
+    findings += _check_latex_dangling_commands(text)
+    findings += _check_doubled_commands(text)
+    findings += _check_latex_unknown_commands(text)
+    findings += _check_latex_image_paths(text, base_dir)
+    return LintReport(findings)
+
+
 def lint_markdown(text: str, *, base_dir: Path | None = None) -> LintReport:
-    """Run every markdown-level check over ``text``.
+    """Run every source-side check over ``text``.
+
+    This is the parser's output, checked before it is chunked and handed to
+    the translating model: a welded ``$$$$`` or a flat heading outline in the
+    source is something the model then faithfully reproduces.
 
     Args:
         text: The markdown to check.
@@ -564,6 +925,7 @@ def lint_markdown(text: str, *, base_dir: Path | None = None) -> LintReport:
     findings += _check_delimiter_whitespace(text)
     findings += _check_escaped_dollars(text)
     findings += _check_braces(text)
+    findings += _check_multiple_tags(text)
     findings += _check_arrays(text)
     findings += _check_dangling_commands(text)
     findings += _check_doubled_commands(text)
@@ -576,8 +938,10 @@ def lint_markdown(text: str, *, base_dir: Path | None = None) -> LintReport:
 def apply_auto_fixes(text: str) -> tuple[str, int]:
     """Apply only the provably safe repairs. Returns ``(text, count)``.
 
-    Exactly one thing qualifies: a known command literally doubled. Every
-    other finding is reported for a human.
+    Two things qualify: a known command literally doubled, and a source
+    number repeated into a heading or caption LaTeX numbers itself. Both are
+    unambiguous -- they cannot be anything but damage, and the repair has one
+    possible form. Every other finding is reported for a human.
     """
     count = 0
 
@@ -589,7 +953,34 @@ def apply_auto_fixes(text: str) -> tuple[str, int]:
         count += 1
         return f"\\{name}"
 
-    return _DOUBLED_COMMAND_RE.sub(repair, text), count
+    text, stripped = strip_duplicated_numbers(text)
+    return _DOUBLED_COMMAND_RE.sub(repair, text), count + stripped
+
+
+def strip_duplicated_numbers(text: str) -> tuple[str, int]:
+    """Delete source numbers from sectioning and caption arguments.
+
+    ``\\section{12.1 Electric Charge}`` -> ``\\section{Electric Charge}``;
+    ``\\section{Electric Charge}`` is left exactly as it is.
+    """
+    pieces: list[str] = []
+    cursor = 0
+    count = 0
+
+    for _command, argument, start, end, _line in _iter_numbered_arguments(text):
+        match = _LEADING_NUMBER_RE.match(argument)
+        if not match:
+            continue
+        pieces.append(text[cursor:start])
+        pieces.append("{" + argument[match.end() :] + "}")
+        cursor = end
+        count += 1
+
+    if not count:
+        return text, 0
+
+    pieces.append(text[cursor:])
+    return "".join(pieces), count
 
 
 # ── Translation-kit checks ──────────────────────────────────────────────────
@@ -660,9 +1051,10 @@ def lint_chunk_pair(name: str, source: str, translation: str) -> list[Finding]:
 def lint_kit(kit_dir: Path) -> LintReport:
     """Check a translation kit: every chunk pair, then the assembled book.
 
-    Expects ``kit_dir/chunks/NNN.md`` (source) and
-    ``kit_dir/translated/NNN.md`` (the saved replies). Missing translations
-    are reported, not raised on.
+    Expects ``kit_dir/chunks/NNN.md`` (the source chunk, still Markdown --
+    that is what MinerU produces) and ``kit_dir/translated/NNN.tex`` (the
+    saved reply, which is LaTeX). Missing translations are reported, not
+    raised on.
     """
     chunks_dir = kit_dir / "chunks"
     translated_dir = kit_dir / "translated"
@@ -683,7 +1075,7 @@ def lint_kit(kit_dir: Path) -> LintReport:
     ratios: list[tuple[str, float]] = []
 
     for source_path in sources:
-        target_path = translated_dir / source_path.name
+        target_path = translated_dir / f"{source_path.stem}{TRANSLATED_SUFFIX}"
         if not target_path.exists():
             findings.append(
                 Finding(
@@ -714,10 +1106,10 @@ def lint_kit(kit_dir: Path) -> LintReport:
                 f"whole book is {overall * 100:.2f}% CJK across {len(translations)} chunk(s)",
             )
         )
-        # Restore the real paths before the markdown checks run. The saved
+        # Restore the real paths before the LaTeX checks run. The saved
         # replies still carry IMG_nnnn tokens, so linting them as-is would
-        # report every single token as an image that does not resolve.
-        findings += lint_markdown(
+        # report every single token as a figure that does not resolve.
+        findings += lint_latex(
             _restore_for_lint(combined, map_path), base_dir=kit_dir
         ).findings
 
@@ -806,26 +1198,35 @@ def _check_image_map(kit_dir: Path, map_path: Path, translations: list[str]) -> 
     ]
 
 
-_FENCE_OPEN_RE = re.compile(r"\A\s*```(?:markdown|md)?\s*\n")
+_FENCE_OPEN_RE = re.compile(r"\A\s*```[A-Za-z0-9_+-]*[ \t]*\n")
 _FENCE_CLOSE_RE = re.compile(r"\n```\s*\Z")
 
 
 def strip_wrapping_fence(text: str) -> str:
-    """Drop a ``` fence wrapped around a whole reply -- a common model habit."""
+    """Drop a ``` fence wrapped around a whole reply.
+
+    AI Studio adds ````latex` around the answer regardless of the prompt
+    telling it not to, and the fence markers are not LaTeX: left in, they are
+    typeset into the book as three literal backticks.
+    """
     return _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", text))
 
 
 __all__ = [
     "IMG_TOKEN_RE",
     "KNOWN_COMMANDS",
+    "TRANSLATED_SUFFIX",
     "Finding",
     "LintReport",
     "Severity",
     "apply_auto_fixes",
     "brace_imbalance",
     "cjk_ratio",
+    "latex_image_refs",
     "lint_chunk_pair",
     "lint_kit",
+    "lint_latex",
     "lint_markdown",
+    "strip_duplicated_numbers",
     "strip_wrapping_fence",
 ]

@@ -5,11 +5,15 @@ A "kit" is a self-contained folder handed to the translating model one chunk
 at a time, plus everything needed to put the replies back together:
 
     <kit>/chunks/001.md ...      source chunks, image paths already tokenised
-    <kit>/translated/001.md ...  the saved replies (you fill this in)
+    <kit>/translated/001.tex ... the saved replies (you fill this in)
     <kit>/images/                the figures
     <kit>/image_map.json         IMG_nnnn -> real filename
     <kit>/source_clean.md        the full normalized source, for comparison
     <kit>/system_prompt.txt      the per-chunk system prompt
+    <kit>/translated_book.tex    the assembled book, once the replies are in
+
+The source chunks stay Markdown -- that is what MinerU produces -- and the
+replies are LaTeX, which is why the two directories carry different suffixes.
 
 Image tokenising is not parser-related and does not go away
 ------------------------------------------------------------
@@ -24,15 +28,16 @@ Chunk size
 ----------
 The binding constraint is the translating model's **output** limit, not its
 context window: it has to emit a full translation of everything it is given.
-~50,000 source characters is what fits comfortably.
+See ``KIT_CHUNK_CHARS`` in ``src.config`` for the measured expansion ratios
+behind the 30,000-character default.
 
-Output stays Markdown
----------------------
-Asking for LaTeX directly was tried and measured: invented
-``example``/``solution`` environments that were never defined, image-hash
-corruption at 7.7%, chunks silently returned untranslated, and raw markdown
-leaking through anyway. Markdown output plus deterministic pandoc conversion
-eliminated all of it.
+Output is LaTeX
+---------------
+Replies are LaTeX body fragments, pasted into VSCode and compiled directly.
+The model's known failure modes there -- invented environments, preamble
+commands, source numbers repeated into headings LaTeX numbers itself -- are
+each an explicit check in ``src.lint``, because every one of them looks
+correct on the page and only fails at compile time.
 """
 
 from __future__ import annotations
@@ -44,10 +49,10 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.config import KIT_CHUNK_CHARS, SOURCE_LANG, TARGET_LANG
-from src.lint import IMG_TOKEN_RE, strip_wrapping_fence
+from src.config import KIT_CHUNK_CHARS
+from src.latex import assemble_document, build_system_prompt
+from src.lint import IMG_TOKEN_RE, TRANSLATED_SUFFIX, latex_image_refs, strip_wrapping_fence
 from src.profiler import BookProfile
-from src.translator import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -57,17 +62,25 @@ IMAGES_DIRNAME = "images"
 IMAGE_MAP_NAME = "image_map.json"
 SOURCE_CLEAN_NAME = "source_clean.md"
 SYSTEM_PROMPT_NAME = "system_prompt.txt"
-ASSEMBLED_NAME = "translated_book.md"
+ASSEMBLED_NAME = "translated_book.tex"
 
 _MD_IMAGE_RE = re.compile(r"(!\[[^\]]*\]\()([^)\s]+)(\))")
 _HTML_IMAGE_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t]*\n")
 
-# Restore only a token that fills a markdown link target or an src attribute
-# entirely. A bare `IMG_0001` in prose is the model talking about a figure,
-# not referencing one, and rewriting it into a path would corrupt the text.
-_RESTORE_MD_RE = re.compile(r"(?<=\()(IMG_\d{4})(?=\))")
-_RESTORE_HTML_RE = re.compile(r'(?<=src=")(IMG_\d{4})(?=")')
+# Restore only a token that fills a LaTeX argument, a markdown link target or
+# an src attribute entirely. A bare `IMG_0001` in prose is the model talking
+# about a figure, not referencing one, and rewriting it into a path would
+# corrupt the text.
+#
+# The braced form is the one that matters now: a translated figure is
+# `\bookfig{IMG_0042}{caption}`. The markdown and HTML forms are kept because
+# the same function restores paths into source markdown as well.
+_RESTORE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<=\{)(IMG_\d{4})(?=\})"),
+    re.compile(r"(?<=\()(IMG_\d{4})(?=\))"),
+    re.compile(r'(?<=src=")(IMG_\d{4})(?=")'),
+)
 
 
 @dataclass(frozen=True)
@@ -127,8 +140,8 @@ def restore_images(text: str, mapping: dict[str, str]) -> tuple[str, list[str]]:
             return token
         return path
 
-    text = _RESTORE_MD_RE.sub(replace, text)
-    text = _RESTORE_HTML_RE.sub(replace, text)
+    for pattern in _RESTORE_RES:
+        text = pattern.sub(replace, text)
     return text, unknown
 
 
@@ -182,8 +195,6 @@ def build_kit(
     images_src: Path | None = None,
     profile: BookProfile | None = None,
     max_chars: int = KIT_CHUNK_CHARS,
-    source_lang: str = SOURCE_LANG,
-    target_lang: str = TARGET_LANG,
 ) -> KitResult:
     """Write a translation kit for ``text`` into ``kit_dir``.
 
@@ -216,13 +227,7 @@ def build_kit(
         json.dumps(image_map, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     (kit_dir / SYSTEM_PROMPT_NAME).write_text(
-        build_system_prompt(
-            source_lang=source_lang,
-            target_lang=target_lang,
-            profile=profile,
-            output_format="markdown",
-        ),
-        encoding="utf-8",
+        build_system_prompt(profile), encoding="utf-8"
     )
 
     if images_src is not None and images_src.is_dir():
@@ -249,7 +254,13 @@ def build_kit(
 
 
 def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
-    """Concatenate the saved translations and restore the real image paths.
+    """Concatenate the saved translations into a compilable ``.tex``.
+
+    The fragments are joined in chunk order, real image filenames are
+    restored from ``image_map.json``, and the result is wrapped in
+    ``assets/preamble.tex``. The output lands in ``kit_dir``, next to
+    ``images/``, because the preamble's ``\\graphicspath`` looks for figures
+    there relative to the ``.tex``.
 
     Returns ``(assembled_path, problems)``. Problems are described, not
     raised on -- ``src.lint`` is what decides whether the build may proceed.
@@ -264,7 +275,7 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
 
     parts: list[str] = []
     for source_path in sources:
-        target_path = translated_dir / source_path.name
+        target_path = translated_dir / f"{source_path.stem}{TRANSLATED_SUFFIX}"
         if not target_path.exists():
             problems.append(f"chunk {source_path.stem} has no translation saved")
             continue
@@ -284,24 +295,26 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
         still_tokenized = set(IMG_TOKEN_RE.findall(merged))
         if still_tokenized:
             problems.append(
-                f"{len(still_tokenized)} image token(s) were not in a link target "
-                "and stayed as text"
+                f"{len(still_tokenized)} image token(s) were not in a figure "
+                "argument and stayed as text"
             )
 
-    out_path = kit_dir / ASSEMBLED_NAME
-    out_path.write_text(merged, encoding="utf-8")
-    logger.info("Assembled %s (%d chars)", out_path, len(merged))
+    out_path = assemble_document([merged], kit_dir / ASSEMBLED_NAME)
+    logger.info("Assembled %s (%d chars of translated body)", out_path, len(merged))
     return out_path, problems
 
 
-def verify_images(markdown: str, kit_dir: Path) -> list[str]:
-    """Every image reference in ``markdown`` that does not resolve on disk.
+def verify_images(text: str, kit_dir: Path) -> list[str]:
+    """Every image reference in ``text`` that does not resolve on disk.
 
-    Called before packaging because a silent path mismatch once produced a
-    zip with zero usable figures -- and the zip looked fine.
+    Handles both sides of the pipeline: markdown image syntax for the source,
+    ``\\bookfig`` / ``\\includegraphics`` for the translation. Called before
+    packaging because a silent path mismatch once produced a zip with zero
+    usable figures -- and the zip looked fine.
     """
-    refs = [m.group(2) for m in _MD_IMAGE_RE.finditer(markdown)]
-    refs += [m.group(2) for m in _HTML_IMAGE_RE.finditer(markdown)]
+    refs = [m.group(2) for m in _MD_IMAGE_RE.finditer(text)]
+    refs += [m.group(2) for m in _HTML_IMAGE_RE.finditer(text)]
+    refs += latex_image_refs(text)
 
     missing: list[str] = []
     for ref in dict.fromkeys(refs):

@@ -1,283 +1,304 @@
 """
-LaTeX assembly: preamble ownership, fragment validation, document assembly
-and PDF compilation.
+LaTeX assets, fragment scanning and document assembly.
 
-Division of labour with the translator
---------------------------------------
-The LLM writes **body fragments only** -- chapter/section content, math,
-tables, figures. This module owns everything that must be identical
-book-wide: documentclass, packages, fonts, title. That split is deliberate.
-A book is translated by hundreds of independent LLM calls; anything global
-that each call re-invents (a package list, a font setup) comes back subtly
-different every time and the document stops compiling. So the model never
-emits a preamble, and ``validate_fragment`` treats preamble commands in a
-fragment as an error rather than something to merge.
+Division of labour with the translating model
+---------------------------------------------
+The model writes **body fragments only** -- chapter/section content, math,
+tables, figures. ``assets/preamble.tex`` owns everything that must be
+identical book-wide: documentclass, packages, caption styling, the
+``example``/``exercise`` environments and the ``\\bookfig`` macros. That split
+is deliberate. A book is translated in dozens of independent conversations;
+anything global that each one re-invents (a package list, a float setup) comes
+back subtly different every time and the document stops compiling. So the
+model never emits a preamble, and preamble commands inside a fragment are
+treated as a defect rather than something to merge.
 
-Everything a profile suggests is treated as untrusted input: package names
-are pattern-checked and denylisted, and the documentclass is clamped, because
-they originate from model output.
+The two assets are hand-maintained and are the specification
+------------------------------------------------------------
+``assets/preamble.tex`` and ``assets/system_prompt_latex.txt`` are edited
+directly by the person running the pipeline -- the prompt in particular is
+tuned against whatever the model got wrong last time. Neither is generated
+from code, and neither should be: this module loads them, substitutes the
+book's glossary into the prompt, and otherwise leaves them alone.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import shutil
-import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
-from src.profiler import BookProfile
+from src.config import ASSETS_DIR
+from src.profiler import BookProfile, profile_to_prompt_block
 
 logger = logging.getLogger(__name__)
 
-# Packages every book needs, regardless of subject.
-BASELINE_PACKAGES: tuple[str, ...] = (
-    "amsmath",
-    "amssymb",
-    "graphicx",
-    "booktabs",
-    "longtable",
-    "array",
-    "hyperref",
+PREAMBLE_PATH: Path = ASSETS_DIR / "preamble.tex"
+SYSTEM_PROMPT_PATH: Path = ASSETS_DIR / "system_prompt_latex.txt"
+
+# Where `profile_to_prompt_block` output goes in the prompt template.
+GLOSSARY_PLACEHOLDER = "{{BOOK_CONTEXT_AND_GLOSSARY}}"
+
+# Every environment the preamble actually defines, plus the LaTeX built-ins it
+# loads packages for. Anything else is "! LaTeX Error: Environment X undefined"
+# at compile time -- during testing the model invented `solution` and
+# `theorem`. Starred variants (equation*, align*) are accepted: the check
+# below strips the star before comparing.
+DEFINED_ENVIRONMENTS: frozenset[str] = frozenset(
+    {
+        "example",
+        "exercise",
+        "figure",
+        "table",
+        "tabular",
+        "itemize",
+        "enumerate",
+        "equation",
+        "align",
+        "center",
+        "minipage",
+        "document",
+        "longtable",
+    }
 )
 
-# Packages a profile is never allowed to add: each one either conflicts with
-# the fixed XeLaTeX/fontspec setup below or re-declares something it already
-# configures.
-DENYLISTED_PACKAGES: frozenset[str] = frozenset(
-    {"inputenc", "fontenc", "ctex", "xeCJK", "fontspec", "geometry", "babel"}
-)
-
-ALLOWED_DOCUMENTCLASSES: tuple[str, ...] = ("book", "report", "article")
-
-_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9\-]*$")
-
-# hyperref must be loaded last, so it is appended after the profile's packages.
-_HYPERREF = "hyperref"
-
-_PREAMBLE_ONLY_COMMANDS: tuple[str, ...] = (
+PREAMBLE_ONLY_COMMANDS: tuple[str, ...] = (
     r"\documentclass",
     r"\usepackage",
     r"\begin{document}",
     r"\end{document}",
 )
 
-_LATEX_ESCAPES = {
-    "\\": r"\textbackslash{}",
-    "&": r"\&",
-    "%": r"\%",
-    "$": r"\$",
-    "#": r"\#",
-    "_": r"\_",
-    "{": r"\{",
-    "}": r"\}",
-    "~": r"\textasciitilde{}",
-    "^": r"\textasciicircum{}",
-}
-_ESCAPE_RE = re.compile("|".join(re.escape(c) for c in _LATEX_ESCAPES))
-
 _COMMAND_RE = re.compile(r"\\([A-Za-z]+)")
 _ENV_ARG_RE = re.compile(r"\s*\{([^{}]*)\}")
+_UNESCAPED_DOLLAR_RE = re.compile(r"(?<!\\)\$")
 
 
-# ── Escaping ────────────────────────────────────────────────────────────────
+# ── Assets ──────────────────────────────────────────────────────────────────
 
 
-def escape_latex(text: str) -> str:
-    """Escape LaTeX's special characters in a plain-text string.
+def load_preamble(path: Path | None = None) -> str:
+    """Read ``assets/preamble.tex``.
 
-    For literal prose only (titles, captions, alt text). Never apply this to
-    text that is already LaTeX -- it would escape the markup itself.
+    Raises:
+        FileNotFoundError: If the asset is missing. There is no generated
+            fallback on purpose -- a book built against an improvised preamble
+            would silently lose the figure macros and the chapter offset.
     """
-    return _ESCAPE_RE.sub(lambda m: _LATEX_ESCAPES[m.group()], text)
+    path = path or PREAMBLE_PATH
+    if not path.exists():
+        raise FileNotFoundError(
+            f"LaTeX preamble not found: {path}. It is a tracked asset; restore it "
+            "rather than generating one."
+        )
+    return path.read_text(encoding="utf-8")
 
 
-# ── Preamble ────────────────────────────────────────────────────────────────
+def build_system_prompt(profile: BookProfile | None = None, *, path: Path | None = None) -> str:
+    """Load the AI Studio system prompt and fold the book's profile into it.
 
-
-def _sanitize_packages(packages: tuple[str, ...]) -> list[str]:
-    """Filter profile-suggested package names (untrusted LLM output)."""
-    clean: list[str] = []
-    for name in packages:
-        candidate = name.strip()
-        if not _PACKAGE_NAME_RE.match(candidate):
-            logger.warning("Dropping malformed LaTeX package name: %r", name)
-            continue
-        if candidate in DENYLISTED_PACKAGES:
-            logger.warning("Dropping conflicting LaTeX package: %s", candidate)
-            continue
-        if candidate not in clean:
-            clean.append(candidate)
-    return clean
-
-
-def _clamp_documentclass(documentclass: str) -> str:
-    candidate = (documentclass or "").strip().lower()
-    if candidate in ALLOWED_DOCUMENTCLASSES:
-        return candidate
-    if candidate:
-        logger.warning("Unsupported documentclass %r; using 'book'", documentclass)
-    return "book"
-
-
-def build_preamble(profile: BookProfile, title: str, *, target_lang: str = "English") -> str:
-    """Build the book-wide preamble (everything before ``\\begin{document}``).
-
-    XeLaTeX + fontspec, with a CJK fallback font guarded by
-    ``\\IfFontExistsTF``: OCR'd Chinese occasionally survives translation in a
-    figure label or a stray character, and without a font that can render it
-    the *entire* build fails on one glyph. The guard means a machine without
-    Noto installed still compiles -- it just cannot render those glyphs.
+    The template lives in ``assets/system_prompt_latex.txt`` rather than in a
+    string literal here because it is edited by hand between books.
+    ``{{BOOK_CONTEXT_AND_GLOSSARY}}`` is replaced with the profiler's block,
+    which is what keeps terminology consistent across independently
+    translated chunks.
     """
-    documentclass = _clamp_documentclass(profile.latex_documentclass)
+    path = path or SYSTEM_PROMPT_PATH
+    if not path.exists():
+        raise FileNotFoundError(
+            f"LaTeX system prompt not found: {path}. It is a tracked asset; restore "
+            "it rather than generating one."
+        )
 
-    packages = list(BASELINE_PACKAGES)
-    packages.remove(_HYPERREF)
-    for name in _sanitize_packages(profile.latex_packages):
-        if name not in packages:
-            packages.append(name)
-    packages.append(_HYPERREF)  # hyperref must be loaded last
+    template = path.read_text(encoding="utf-8")
+    block = profile_to_prompt_block(profile) if profile is not None else ""
 
-    package_lines = "\n".join(f"\\usepackage{{{name}}}" for name in packages)
+    if GLOSSARY_PLACEHOLDER not in template:
+        logger.warning(
+            "%s has no %s placeholder; the book context and glossary were not "
+            "inserted.",
+            path,
+            GLOSSARY_PLACEHOLDER,
+        )
+        return template
 
-    return f"""\\documentclass[11pt]{{{documentclass}}}
-
-% Generated by src/latex.py -- do not edit by hand.
-% Subject: {escape_latex(profile.subject or "general")} | \
-Level: {escape_latex(profile.education_level or "university")} | \
-Target language: {escape_latex(target_lang)}
-
-\\usepackage{{fontspec}}
-\\usepackage[margin=1in]{{geometry}}
-
-% CJK fallback: any untranslated glyph (figure labels, stray OCR output)
-% would otherwise abort the whole build.
-\\IfFontExistsTF{{Noto Sans CJK SC}}{{
-  \\newfontfamily\\cjkfallbackfont{{Noto Sans CJK SC}}
-  \\newcommand{{\\cjk}}[1]{{{{\\cjkfallbackfont #1}}}}
-}}{{
-  \\IfFontExistsTF{{Noto Sans SC}}{{
-    \\newfontfamily\\cjkfallbackfont{{Noto Sans SC}}
-    \\newcommand{{\\cjk}}[1]{{{{\\cjkfallbackfont #1}}}}
-  }}{{
-    \\newcommand{{\\cjk}}[1]{{#1}}
-  }}
-}}
-
-{package_lines}
-
-\\hypersetup{{
-  colorlinks=true,
-  linkcolor=black,
-  urlcolor=blue,
-  pdftitle={{{escape_latex(title)}}}
-}}
-
-\\title{{{escape_latex(title)}}}
-\\date{{}}
-"""
+    return template.replace(GLOSSARY_PLACEHOLDER, block)
 
 
-# ── Fragment validation ─────────────────────────────────────────────────────
+# ── Fragment scanning ───────────────────────────────────────────────────────
 
 
-def _scan(tex: str) -> tuple[list[str], int, int, int]:
-    """Single pass over ``tex``, returning
-    ``(issues, brace_depth, inline_dollars, display_dollars)``.
+@dataclass(frozen=True)
+class EnvIssue:
+    """One environment defect, with the 1-based line it was found on."""
 
-    Escaped characters (``\\{``, ``\\$``, ...) and ``%`` comments are skipped,
-    so they never affect the balance counts.
+    kind: str  # unclosed | crossed | stray-end | undefined | missing-name
+    env: str
+    line: int
+    message: str
+
+
+def scan_environments(text: str) -> list[EnvIssue]:
+    """Every ``\\begin``/``\\end`` defect in ``text``.
+
+    One pass, tracking line numbers as it goes. Escaped literals (``\\{``,
+    ``\\$``) and ``%`` comments are skipped so they cannot fake an
+    environment. Crossed pairs (``\\begin{itemize}...\\end{enumerate}``) are
+    reported as such rather than as two separate imbalances, because that is
+    how they read in the source.
     """
-    issues: list[str] = []
-    env_stack: list[str] = []
-    depth = 0
-    inline_dollars = 0
-    display_dollars = 0
-    saw_negative_depth = False
+    issues: list[EnvIssue] = []
+    stack: list[tuple[str, int]] = []
 
     i = 0
-    length = len(tex)
+    line = 1
+    length = len(text)
+
     while i < length:
-        char = tex[i]
+        char = text[i]
 
-        if char == "\\":
-            match = _COMMAND_RE.match(tex, i)
-            if not match:
-                i += 2  # escaped literal: \{ \} \$ \& \% \# \_ \\ ...
-                continue
-
-            name = match.group(1)
-            i = match.end()
-            if name in ("begin", "end"):
-                arg = _ENV_ARG_RE.match(tex, i)
-                if not arg:
-                    issues.append(f"\\{name} is missing its environment name")
-                    continue
-                env = arg.group(1).strip()
-                i = arg.end()
-                if name == "begin":
-                    env_stack.append(env)
-                elif not env_stack:
-                    issues.append(f"\\end{{{env}}} has no matching \\begin")
-                elif env_stack[-1] != env:
-                    issues.append(f"\\begin{{{env_stack.pop()}}} is closed by \\end{{{env}}}")
-                else:
-                    env_stack.pop()
+        if char == "\n":
+            line += 1
+            i += 1
             continue
 
         if char == "%":
-            newline = tex.find("\n", i)
-            i = length if newline == -1 else newline + 1
+            newline = text.find("\n", i)
+            if newline == -1:
+                break
+            i = newline
             continue
 
+        if char == "\\":
+            match = _COMMAND_RE.match(text, i)
+            if not match:
+                # An escaped literal: \{ \} \$ \& \% \# \_ \\ ...
+                if i + 1 < length and text[i + 1] == "\n":
+                    line += 1
+                i += 2
+                continue
+
+            name = match.group(1)
+            if name not in ("begin", "end"):
+                i = match.end()
+                continue
+
+            arg = _ENV_ARG_RE.match(text, match.end())
+            if arg is None:
+                issues.append(
+                    EnvIssue(
+                        "missing-name", "", line, f"\\{name} is missing its environment name"
+                    )
+                )
+                i = match.end()
+                continue
+
+            env = arg.group(1).strip()
+            at_line = line
+            line += text.count("\n", i, arg.end())
+            i = arg.end()
+
+            if name == "begin":
+                stack.append((env, at_line))
+                if env.rstrip("*") not in DEFINED_ENVIRONMENTS:
+                    issues.append(
+                        EnvIssue(
+                            "undefined",
+                            env,
+                            at_line,
+                            f"\\begin{{{env}}} is not one of the defined environments "
+                            "-- '! LaTeX Error: Environment "
+                            f"{env} undefined.'",
+                        )
+                    )
+            elif not stack:
+                issues.append(
+                    EnvIssue(
+                        "stray-end", env, at_line, f"\\end{{{env}}} has no matching \\begin"
+                    )
+                )
+            elif stack[-1][0] != env:
+                open_env, open_line = stack.pop()
+                issues.append(
+                    EnvIssue(
+                        "crossed",
+                        env,
+                        at_line,
+                        f"\\begin{{{open_env}}} (line {open_line}) is closed by "
+                        f"\\end{{{env}}}",
+                    )
+                )
+            else:
+                stack.pop()
+            continue
+
+        i += 1
+
+    for env, at_line in reversed(stack):
+        issues.append(
+            EnvIssue("unclosed", env, at_line, f"\\begin{{{env}}} is never closed")
+        )
+
+    return sorted(issues, key=lambda issue: issue.line)
+
+
+def brace_imbalance(text: str) -> int:
+    """Net brace depth, ignoring escaped ``\\{`` and ``\\}``.
+
+    Returns the closing surplus as a negative number when the text dips below
+    depth 0 at any point, so ``}{`` is reported even though it nets to zero.
+    """
+    cleaned = re.sub(r"\\[{}]", "", text)
+    depth = 0
+    low = 0
+    for char in cleaned:
         if char == "{":
             depth += 1
         elif char == "}":
             depth -= 1
-            if depth < 0:
-                saw_negative_depth = True
-                depth = 0  # keep scanning without cascading errors
-        elif char == "$":
-            if tex.startswith("$$", i):
-                display_dollars += 1
-                i += 2
-                continue
-            inline_dollars += 1
+            low = min(low, depth)
+    return depth if depth else low
 
-        i += 1
 
-    for env in reversed(env_stack):
-        issues.append(f"\\begin{{{env}}} is never closed")
-    if saw_negative_depth:
-        issues.append("unbalanced braces: a closing '}' has no matching '{'")
+def find_preamble_leakage(text: str) -> list[tuple[int, str]]:
+    """``(line, command)`` for every preamble command found in a body fragment.
 
-    return issues, depth, inline_dollars, display_dollars
+    The preamble is added once, by ``assemble_document``. A second
+    ``\\documentclass`` or a stray ``\\end{document}`` halfway through the book
+    ends the document there and silently drops everything after it.
+    """
+    hits: list[tuple[int, str]] = []
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        for command in PREAMBLE_ONLY_COMMANDS:
+            if command in line:
+                hits.append((lineno, command))
+    return hits
 
 
 def validate_fragment(tex: str) -> list[str]:
-    """Check a model-produced LaTeX body fragment. ``[]`` means valid.
+    """Check one model-produced body fragment. ``[]`` means usable.
 
-    Catches the failure modes that actually show up in translated output:
-    preamble commands leaking into a fragment, crossed or unclosed
-    environments, unbalanced braces, and unclosed math.
+    The fast structural subset of ``src.lint``: this runs inside the
+    translator's heal loop, where the only question is whether to re-ask for
+    this chunk. ``src.lint`` is what produces the reviewable report.
     """
-    issues: list[str] = []
+    issues = [
+        f"{command} must not appear in a body fragment "
+        "(the preamble is added once, at assembly)"
+        for command in dict.fromkeys(command for _, command in find_preamble_leakage(tex))
+    ]
+    issues += [issue.message for issue in scan_environments(tex)]
 
-    for command in _PREAMBLE_ONLY_COMMANDS:
-        if command in tex:
-            issues.append(
-                f"{command} must not appear in a body fragment "
-                "(the preamble is generated separately)"
-            )
+    imbalance = brace_imbalance(tex)
+    if imbalance > 0:
+        issues.append(f"unbalanced braces: {imbalance} unclosed '{{'")
+    elif imbalance < 0:
+        issues.append("unbalanced braces: a closing '}' has no matching '{'")
 
-    scan_issues, depth, inline_dollars, display_dollars = _scan(tex)
-    issues.extend(scan_issues)
-
-    if depth > 0:
-        issues.append(f"unbalanced braces: {depth} unclosed '{{'")
-    if inline_dollars % 2 != 0:
+    if len(_UNESCAPED_DOLLAR_RE.findall(tex.replace("$$", ""))) % 2:
         issues.append("unbalanced inline math: odd number of unescaped '$'")
-    if display_dollars % 2 != 0:
+    if tex.count("$$") % 2:
         issues.append("unbalanced display math: odd number of '$$'")
 
     return issues
@@ -287,43 +308,41 @@ def validate_fragment(tex: str) -> list[str]:
 
 
 def _strip_preamble_leakage(body: str) -> str:
-    """Drop preamble commands a model emitted despite being told not to.
+    """Drop preamble lines a model emitted despite being told not to.
 
     Cheaper than failing assembly: the fragment's real content is fine, and
-    the preamble this module generates is the one that must win.
+    the asset preamble is the one that must win. ``src.lint`` reports the same
+    lines, so nothing is hidden by doing this.
     """
     lines = [
         line
         for line in body.splitlines()
-        if not any(line.lstrip().startswith(cmd) for cmd in _PREAMBLE_ONLY_COMMANDS)
+        if not any(line.lstrip().startswith(cmd) for cmd in PREAMBLE_ONLY_COMMANDS)
     ]
     return "\n".join(lines).strip("\n")
 
 
 def assemble_document(
     body_parts: list[str],
-    profile: BookProfile,
-    title: str,
     output_path: Path,
     *,
-    target_lang: str = "English",
+    preamble_path: Path | None = None,
 ) -> Path:
-    """Wrap ``body_parts`` in a generated preamble and write a full .tex file."""
+    """Wrap ``body_parts`` in the asset preamble and write a compilable .tex.
+
+    ``assets/preamble.tex`` already ends with ``\\begin{document}``,
+    ``\\frontmatter``, ``\\tableofcontents``, ``\\mainmatter`` and the chapter
+    counter, so only ``\\end{document}`` is added after the body.
+
+    The file must be written next to ``images/``: the preamble's
+    ``\\graphicspath`` looks for figures there, relative to the .tex.
+    """
     bodies = [
         cleaned for cleaned in (_strip_preamble_leakage(part) for part in body_parts) if cleaned
     ]
 
     document = "\n\n".join(
-        [
-            build_preamble(profile, title, target_lang=target_lang),
-            "\\begin{document}",
-            "\\maketitle",
-            "\\tableofcontents",
-            "\\clearpage",
-            "\n\n".join(bodies),
-            "\\end{document}",
-            "",
-        ]
+        [load_preamble(preamble_path).rstrip("\n"), "\n\n".join(bodies), "\\end{document}", ""]
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,112 +351,18 @@ def assemble_document(
     return output_path
 
 
-# ── Compilation ─────────────────────────────────────────────────────────────
-
-_LOG_ERROR_RE = re.compile(r"^(!.*|l\.\d+.*|.*Fatal error.*|.*Emergency stop.*)$", re.MULTILINE)
-_MAX_ERROR_LINES = 40
-
-
-def _log_excerpt(log_path: Path) -> str:
-    """Pull just the error lines out of a LaTeX log.
-
-    A .log for a real book runs to tens of thousands of lines; the caller
-    needs the handful starting with '!' and their line references.
-    """
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return f"(no readable log at {log_path})"
-
-    matches = _LOG_ERROR_RE.findall(log_text)
-    if not matches:
-        return "\n".join(log_text.splitlines()[-_MAX_ERROR_LINES:])
-    return "\n".join(matches[:_MAX_ERROR_LINES])
-
-
-def compile_pdf(
-    tex_path: Path,
-    *,
-    engine: str = "xelatex",
-    passes: int = 2,
-    timeout_seconds: int = 1800,
-) -> tuple[bool, str]:
-    """Compile ``tex_path`` to PDF.
-
-    Runs ``passes`` times so the table of contents and cross-references
-    resolve, and always under ``-interaction=nonstopmode`` -- a single bad
-    macro in translated output would otherwise stop and wait forever for
-    keyboard input that no automated run will ever provide.
-
-    Returns:
-        ``(succeeded, log_excerpt)``. Never raises for a compilation failure;
-        a missing engine, a timeout and a LaTeX error all come back as
-        ``(False, <explanation>)``.
-    """
-    if shutil.which(engine) is None:
-        return (
-            False,
-            f"LaTeX engine {engine!r} is not on PATH. Install TeX Live or MiKTeX "
-            f"(and make sure {engine} is on PATH), or pass engine=... explicitly.",
-        )
-    if not tex_path.exists():
-        return False, f"LaTeX source not found: {tex_path}"
-
-    work_dir = tex_path.parent
-    command = [
-        engine,
-        "-interaction=nonstopmode",
-        "-output-directory",
-        str(work_dir),
-        str(tex_path),
-    ]
-
-    for attempt in range(1, max(1, passes) + 1):
-        logger.info("Running %s (pass %d/%d) on %s", engine, attempt, passes, tex_path.name)
-        try:
-            result = subprocess.run(  # noqa: S603 - engine is a configured binary name
-                command,
-                cwd=work_dir,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            return (
-                False,
-                f"{engine} timed out after {timeout_seconds}s on pass {attempt}/{passes}.",
-            )
-        except OSError as exc:
-            return False, f"Could not run {engine}: {exc}"
-
-        if result.returncode != 0:
-            excerpt = _log_excerpt(tex_path.with_suffix(".log"))
-            return (
-                False,
-                f"{engine} failed on pass {attempt}/{passes} "
-                f"(exit {result.returncode}):\n{excerpt}",
-            )
-
-    pdf_path = tex_path.with_suffix(".pdf")
-    if not pdf_path.exists():
-        return (
-            False,
-            f"{engine} reported success but no PDF was produced:\n"
-            f"{_log_excerpt(tex_path.with_suffix('.log'))}",
-        )
-
-    return True, f"PDF written to {pdf_path}"
-
-
 __all__ = [
-    "ALLOWED_DOCUMENTCLASSES",
-    "BASELINE_PACKAGES",
-    "DENYLISTED_PACKAGES",
+    "DEFINED_ENVIRONMENTS",
+    "GLOSSARY_PLACEHOLDER",
+    "PREAMBLE_ONLY_COMMANDS",
+    "PREAMBLE_PATH",
+    "SYSTEM_PROMPT_PATH",
+    "EnvIssue",
     "assemble_document",
-    "build_preamble",
-    "compile_pdf",
-    "escape_latex",
+    "brace_imbalance",
+    "build_system_prompt",
+    "find_preamble_leakage",
+    "load_preamble",
+    "scan_environments",
     "validate_fragment",
 ]

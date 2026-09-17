@@ -12,6 +12,7 @@ import pytest
 from tenacity import wait_none
 
 from src.config import API_MAX_RETRIES, MAX_HEAL_ATTEMPTS
+from src.latex import GLOSSARY_PLACEHOLDER, SYSTEM_PROMPT_PATH
 from src.llm.base import BaseLLM
 from src.profiler import BookProfile
 from src.translator import (
@@ -165,7 +166,7 @@ def test_invalid_latex_triggers_heal_quoting_the_defect() -> None:
     fixed = _long_text("The equation states that") + "\n\\[ x = y \\]"
     llm = FakeLLM([broken, fixed])
 
-    result = translate_chunk(source, llm=llm, output_format="latex")
+    result = translate_chunk(source, llm=llm)
 
     assert result == fixed
     assert llm.call_count == 2
@@ -173,12 +174,12 @@ def test_invalid_latex_triggers_heal_quoting_the_defect() -> None:
     assert "\\begin{equation} is never closed" in llm.calls[1][0]
 
 
-def test_latex_mode_accepts_a_sound_fragment_without_healing() -> None:
+def test_a_sound_fragment_is_accepted_without_healing() -> None:
     source = _long_text("公式", repeats=10)
     sound = _long_text("A well-formed") + "\n\\begin{itemize}\n\\item one\n\\end{itemize}"
     llm = FakeLLM([sound])
 
-    assert translate_chunk(source, llm=llm, output_format="latex") == sound
+    assert translate_chunk(source, llm=llm) == sound
     assert llm.call_count == 1
 
 
@@ -232,7 +233,7 @@ def test_heading_emitted_in_both_languages_triggers_heal() -> None:
     good = "\\section{Electric Field}\n" + _long_text("The field", repeats=8)
     llm = FakeLLM([half_done, good])
 
-    result = translate_chunk(_long_chinese(), llm=llm, output_format="latex")
+    result = translate_chunk(_long_chinese(), llm=llm)
 
     assert result == good
     heal_prompt = llm.calls[1][0]
@@ -396,7 +397,20 @@ def test_translate_markdown_positional_target_lang_still_works() -> None:
 
     translate_markdown("你好。", "French", llm=llm)
 
-    assert "French" in llm.calls[0][0]
+    assert llm.call_count == 1
+
+
+def test_every_chunk_gets_the_prompt_asset_verbatim() -> None:
+    """The API path and the paste-into-AI-Studio path must send the same
+    instructions, so both load assets/system_prompt_latex.txt."""
+    text = "\n\n".join(_long_text(f"para{i}", repeats=60) for i in range(6))
+    llm = FakeLLM()
+    asset = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+
+    translate_markdown(text, "English", llm=llm)
+
+    assert llm.call_count > 1
+    assert all(system == asset.replace(GLOSSARY_PLACEHOLDER, "") for system, _, _ in llm.calls)
 
 
 def test_profile_glossary_reaches_every_chunk_prompt() -> None:
@@ -408,11 +422,6 @@ def test_profile_glossary_reaches_every_chunk_prompt() -> None:
 
     assert llm.call_count > 1
     assert all("导数 -> derivative" in system for system, _, _ in llm.calls)
-
-
-def test_unknown_output_format_raises_value_error() -> None:
-    with pytest.raises(ValueError, match="output_format"):
-        translate_markdown("你好。", "English", llm=FakeLLM(), output_format="rtf")
 
 
 # ── translate_book ──────────────────────────────────────────────────────────
@@ -430,51 +439,21 @@ def _write_book(tmp_path: Path) -> tuple[Path, Path]:
     return merged, work_dir
 
 
-def test_translate_book_markdown_writes_checkpoints_and_merged_output(tmp_path: Path) -> None:
-    merged, work_dir = _write_book(tmp_path)
-    llm = FakeLLM([_long_text("translated", repeats=3)])
-
-    output = translate_book(merged, work_dir, llm=llm, use_profile=False)
-
-    assert output == work_dir / "translated_merged.md"
-    assert "translated sentence" in output.read_text(encoding="utf-8")
-    checkpoints = sorted((work_dir / "translated_chapters").glob("*"))
-    assert len(checkpoints) == 2
-    assert all(path.suffix == ".md" for path in checkpoints)
-
-
-def test_translate_book_latex_mode_uses_tex_checkpoints(tmp_path: Path) -> None:
+def test_translate_book_writes_checkpoints_and_one_compilable_tex(tmp_path: Path) -> None:
     merged, work_dir = _write_book(tmp_path)
     llm = FakeLLM(["\\chapter{Introduction}\n" + _long_text("Translated", repeats=3)])
 
-    output = translate_book(
-        merged, work_dir, llm=llm, use_profile=False, output_format="latex", title="A Textbook"
-    )
+    output = translate_book(merged, work_dir, llm=llm, use_profile=False)
 
     assert output == work_dir / "translated_book.tex"
     tex = output.read_text(encoding="utf-8")
     assert tex.count("\\begin{document}") == 1
+    assert tex.count("\\end{document}") == 1
     assert "\\chapter{Introduction}" in tex
-    assert "A Textbook" in tex
 
     checkpoints = sorted((work_dir / "translated_chapters").glob("*"))
     assert len(checkpoints) == 2
     assert all(path.suffix == ".tex" for path in checkpoints)
-
-
-def test_switching_output_format_re_translates_instead_of_mixing(tmp_path: Path) -> None:
-    merged, work_dir = _write_book(tmp_path)
-    body = _long_text("Translated", repeats=3)
-
-    translate_book(merged, work_dir, llm=FakeLLM([body]), use_profile=False)
-    latex_llm = FakeLLM(["\\chapter{One}\n" + body])
-    translate_book(
-        merged, work_dir, llm=latex_llm, use_profile=False, output_format="latex"
-    )
-
-    assert latex_llm.call_count == 2  # both chapters redone for the new format
-    suffixes = {path.suffix for path in (work_dir / "translated_chapters").glob("*")}
-    assert suffixes == {".md", ".tex"}
 
 
 def test_resume_skips_chapters_that_already_have_checkpoints(tmp_path: Path) -> None:
@@ -482,7 +461,7 @@ def test_resume_skips_chapters_that_already_have_checkpoints(tmp_path: Path) -> 
     body = _long_text("translated", repeats=3)
     translate_book(merged, work_dir, llm=FakeLLM([body]), use_profile=False)
 
-    checkpoints = sorted((work_dir / "translated_chapters").glob("*.md"))
+    checkpoints = sorted((work_dir / "translated_chapters").glob("*.tex"))
     checkpoints[0].unlink()  # simulate an interrupted run
 
     second_llm = FakeLLM([body])
@@ -521,12 +500,3 @@ def test_fully_translated_book_costs_zero_llm_calls(tmp_path: Path) -> None:
     assert output.exists()
 
 
-def test_translate_book_rejects_unknown_output_format_before_any_work(tmp_path: Path) -> None:
-    merged, work_dir = _write_book(tmp_path)
-    llm = FakeLLM()
-
-    with pytest.raises(ValueError, match="output_format"):
-        translate_book(merged, work_dir, llm=llm, output_format="epub")
-
-    assert llm.call_count == 0
-    assert not (work_dir / "translated_chapters").exists()

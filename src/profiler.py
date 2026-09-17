@@ -334,8 +334,8 @@ def profile_to_prompt_block(profile: BookProfile, *, max_glossary: int = 40) -> 
 # The cloud parser gets levels 1 and 2 right but flattens everything below:
 # on the test book, 20 headings at `#`, 422 at `##`, none deeper. Sections
 # (`## 12.1 电荷`), subsections (`## 1. 电荷的种类`) and worked examples
-# (`## 例12.3`) all land at `##`, so pandoc renders them at identical weight
-# and the outline is wrong.
+# (`## 例12.3`) all land at `##`, so the model has nothing to tell them apart
+# by and the outline of the translated book is wrong.
 #
 # This cannot be a fixed regex: heading conventions vary between books, which
 # is exactly the kind of per-book judgement the profiler already exists to

@@ -43,9 +43,9 @@ logger = logging.getLogger(__name__)
 
 HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*\S)[ \t]*$")
 
-# Pandoc's inline-math rule: an opening `$` must be followed by a non-space
-# and a closing `$` preceded by one. `(?<!\$)`/`(?!\$)` keep this from
-# matching the halves of a `$$` display delimiter.
+# The conventional inline-math rule: an opening `$` must be followed by a
+# non-space and a closing `$` preceded by one. `(?<!\$)`/`(?!\$)` keep this
+# from matching the halves of a `$$` display delimiter.
 INLINE_MATH_RE = re.compile(r"(?<!\$)\$([^$\n]+?)\$(?!\$)")
 
 _DISPLAY_ONE_LINE_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -177,8 +177,8 @@ def dollar_run_histogram(text: str) -> dict[int, int]:
 def display_parity(text: str) -> tuple[int, bool]:
     """Return ``(count of "$$" delimiters, whether that count is even)``.
 
-    An odd count means a display block is never closed, which makes pandoc
-    read the entire rest of the document as mathematics.
+    An odd count means a display block is never closed, so everything after
+    it reads as mathematics.
     """
     count = text.count("$$")
     return count, count % 2 == 0
@@ -187,8 +187,8 @@ def display_parity(text: str) -> tuple[int, bool]:
 def find_delimiter_whitespace(text: str) -> list[tuple[int, str]]:
     """Find inline spans padded with whitespace inside their ``$`` delimiters.
 
-    Pandoc does not read ``$n S { \\mathrm { d } } l $`` as math at all: it
-    escapes the ``$`` and the LaTeX leaks into text mode, giving
+    ``$n S { \\mathrm { d } } l $`` does not read as math at all: the LaTeX
+    inside it leaks into text mode, giving
     ``! LaTeX Error: \\mathrm allowed only in math mode``.
 
     Zero of the cloud VLM parse's 6,641 inline spans hit this, so it is a
@@ -402,7 +402,7 @@ def normalize(text: str, *, fix_math_spacing: bool = False) -> NormalizeResult:
     if not even:
         logger.warning(
             "Odd number of `$$` delimiters (%d): a display block is never closed, "
-            "which makes pandoc read the rest of the document as mathematics.",
+            "so everything after it reads as mathematics.",
             dollar_count,
         )
     welded = [n for n in dollar_run_histogram(result_text) if n > 2]

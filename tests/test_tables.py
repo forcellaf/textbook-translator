@@ -1,8 +1,8 @@
-"""Tests for src.tables (HTML tables -> pandoc pipe tables).
+"""Tests for src.tables (HTML tables -> markdown pipe tables).
 
-Pandoc's markdown reader keeps raw HTML as an opaque block and its LaTeX
-writer discards it, so an unconverted table vanishes from the PDF entirely.
-The other half of the contract matters just as much: a table that cannot be
+A pipe table makes the grid explicit, so the translating model reproduces it
+as a LaTeX tabular instead of inferring the structure from <td> tags. The
+other half of the contract matters just as much: a table that cannot be
 represented faithfully must come back byte-identical, never guessed at.
 """
 
@@ -68,7 +68,7 @@ def test_latex_inside_cells_survives_untouched() -> None:
 
 
 def test_the_table_is_surrounded_by_blank_lines() -> None:
-    """Glued to adjacent prose, pandoc reads the whole thing as a paragraph."""
+    """Glued to adjacent prose, the table reads as part of the paragraph."""
     result, _ = convert_html_tables(f"前言\n{WELL_FORMED}\n后记")
 
     lines = result.split("\n")
