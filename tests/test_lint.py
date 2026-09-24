@@ -126,6 +126,317 @@ def test_an_undefined_environment_is_flagged_by_name_and_line() -> None:
     assert findings[0].line == CLEAN_LATEX.count("\n") + 2
 
 
+def test_math_environments_are_not_reported_as_undefined() -> None:
+    """Regression: `array` was flagged ~1,000 times on a real book. Maths is
+    copied through verbatim, so whatever the source used arrives untouched --
+    and array, cases and the matrix environments all compile fine."""
+    report = lint_latex(
+        "\\[\n\\begin{array}{l} a = b \\\\ c = d \\end{array}\n\\]\n\n"
+        "\\begin{equation}\n\\begin{cases} x & y \\\\ z & w \\end{cases}\n\\end{equation}\n\n"
+        "\\[\n\\begin{pmatrix} 1 & 0 \\end{pmatrix}\n\\]\n"
+    )
+
+    assert "undefined-environment" not in _checks(report.findings), report.render()
+
+
+def test_an_invented_environment_is_still_flagged_alongside_them() -> None:
+    """The list got longer, so this is the guard that it did not get useless:
+    amsthm is not loaded, so `theorem` and `proof` do not exist here."""
+    for invented in ("solution", "theorem", "proof", "note", "definition"):
+        report = lint_latex(f"\\begin{{{invented}}}\nBecause.\n\\end{{{invented}}}\n")
+        assert "undefined-environment" in _checks(report.findings, Severity.REVIEW), invented
+
+
+def test_literal_unicode_that_pdflatex_cannot_typeset_is_flagged() -> None:
+    """A real book carried 482 of these. Each one is a fatal error, and
+    pdflatex reports one per compile."""
+    report = lint_latex("where ε₀ = 8.85 and the angle is θ.\n")
+
+    findings = [f for f in report.findings if f.check == "unicode-character"]
+    assert {f.severity for f in findings} == {Severity.REVIEW}
+    assert any("U+03B5" in f.message for f in findings)
+    assert any("U+03B8" in f.message for f in findings)
+    assert report.exit_code == 1
+
+
+def test_a_stray_cjk_character_is_flagged_even_below_the_residue_threshold() -> None:
+    """cjk-residue measures a ratio: six characters in a 700,000-character
+    book is 0.01% and invisible to it, and still six dead builds."""
+    report = lint_latex(CLEAN_LATEX * 4 + "\nThe value 为 is given.\n")
+
+    assert "cjk-residue" not in _checks(report.findings)  # ratio check is elsewhere
+    assert any(
+        f.check == "unicode-character" and "U+4E3A" in f.message for f in report.findings
+    )
+
+
+def test_ordinary_latin1_and_real_punctuation_are_left_alone() -> None:
+    """inputenc handles these, so flagging them would be noise: 25 °C, ±5%,
+    a 2 × 3 grid, an em dash and curly quotes."""
+    report = lint_latex(
+        "At 25 °C the value is 3.2 ±5%, in a 2 × 3 grid — "
+        "the “standard” case…\n"
+    )
+
+    assert "unicode-character" not in _checks(report.findings), report.render()
+
+
+def test_zero_width_characters_are_deleted_not_reviewed() -> None:
+    """Invisible in every editor, fatal to pdflatex, and meaningless -- so
+    deleting is the only repair there is."""
+    text = "The field ​strength E​ is given.\n"
+    report = lint_latex(text)
+
+    assert "zero-width-character" in _checks(report.findings, Severity.AUTO_FIX)
+    assert "unicode-character" not in _checks(report.findings)
+
+    fixed, count = apply_auto_fixes(text)
+    assert count == 2
+    assert fixed == "The field strength E is given.\n"
+
+
+def test_a_display_delimiter_that_lost_its_backslash_is_flagged() -> None:
+    """Measured on a real book: 971 blocks opened with `\\[`, 94 with a bare
+    `[`. The bracket typesets literally and the maths after it runs in text
+    mode, so the first \\frac fails."""
+    report = lint_latex("Then\n\n[\n\\begin{array}{l} a = b \\end{array}\n]\n")
+
+    findings = [f for f in report.findings if f.check == "display-delimiter"]
+    assert [f.line for f in findings] == [3, 5]
+    assert all(f.severity is Severity.AUTO_FIX for f in findings)
+
+
+def test_correct_display_delimiters_are_not_flagged() -> None:
+    report = lint_latex(CLEAN_LATEX + "\n\\[\na = b\n\\]\n\nA bracket [like this] in prose.\n")
+
+    assert "display-delimiter" not in _checks(report.findings), report.render()
+
+
+def test_the_display_delimiter_fix_restores_both_backslashes() -> None:
+    fixed, count = apply_auto_fixes("Then\n\n[\na = b\n]\n\nand\n\n[\nc = d\n]\n")
+
+    assert count == 4
+    assert fixed == "Then\n\n\\[\na = b\n\\]\n\nand\n\n\\[\nc = d\n\\]\n"
+
+
+def test_unpaired_bare_brackets_are_reported_instead_of_repaired() -> None:
+    """Which block an odd bracket belongs to is a guess, so it is not one."""
+    text = "[\na = b\n]\n\n]\n"
+    report = lint_latex(text)
+
+    assert "display-delimiter" in _checks(report.findings, Severity.REVIEW)
+    assert apply_auto_fixes(text) == (text, 0)
+
+
+def test_a_tag_in_unnumbered_display_math_is_flagged_and_promoted() -> None:
+    """amsmath allows \\tag only in an equation-like environment. The book
+    tags 570 of its equations, so this arrives whenever the model wraps one
+    of them in \\[ ... \\] instead."""
+    text = "\\[\nE = mc^2 \\tag{12.1}\n\\]\n"
+    report = lint_latex(text)
+
+    findings = [f for f in report.findings if f.check == "misplaced-tag"]
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.AUTO_FIX
+
+    fixed, count = apply_auto_fixes(text)
+    assert count == 1
+    assert fixed == "\\begin{equation}\nE = mc^2 \\tag{12.1}\n\\end{equation}\n"
+
+
+def test_the_same_applies_to_dollar_display_math() -> None:
+    fixed, count = apply_auto_fixes("$$\nx = y \\tag{3.2}\n$$\n")
+
+    assert count == 1
+    assert fixed == "\\begin{equation}\nx = y \\tag{3.2}\n\\end{equation}\n"
+
+
+def test_untagged_display_math_is_left_in_place() -> None:
+    """Most display maths is unnumbered and belongs exactly as it is."""
+    text = "\\[\nE = mc^2\n\\]\n\n$$\nx = y\n$$\n"
+    report = lint_latex(text)
+
+    assert "misplaced-tag" not in _checks(report.findings)
+    assert apply_auto_fixes(text) == (text, 0)
+
+
+def test_a_block_with_two_tags_is_reported_not_promoted() -> None:
+    """Promoting it would not fix it -- amsmath rejects the second tag inside
+    `equation` too -- and choosing between them means looking at the book."""
+    text = "$$\nx = 1 \\tag {30}\\tag{30.12}\n$$\n"
+    report = lint_latex(text)
+
+    assert "multiple-tags" in _checks(report.findings, Severity.REVIEW)
+    assert "misplaced-tag" not in _checks(report.findings)
+    assert apply_auto_fixes(text) == (text, 0)
+
+
+def test_a_tag_already_inside_an_equation_is_left_alone() -> None:
+    text = "\\begin{equation}\nE = mc^2 \\tag{12.1}\n\\end{equation}\n"
+
+    assert "misplaced-tag" not in _checks(lint_latex(text).findings)
+    assert apply_auto_fixes(text) == (text, 0)
+
+
+def test_a_doubled_structural_command_is_caught_and_repaired() -> None:
+    """Regression: `\\sectionsection` stopped a real build five times. It is
+    the same defect as `\\mathrmmathrm`, but `section` is not in
+    KNOWN_COMMANDS -- that list is a math vocabulary -- so nothing reported
+    it and nothing repaired it."""
+    text = "\\sectionsection{Selected Answers}\n\\sectionsection*{Problem-Solving Points}\n"
+    report = lint_latex(text)
+
+    assert "doubled-command" in _checks(report.findings, Severity.AUTO_FIX)
+
+    fixed, count = apply_auto_fixes(text)
+    assert count == 2
+    assert fixed == "\\section{Selected Answers}\n\\section*{Problem-Solving Points}\n"
+
+
+def test_a_doubled_command_is_not_also_reported_as_unknown() -> None:
+    """It is unknown by definition, but `--fix` repairs it, and the
+    unknown-command advice -- "add it to KNOWN_COMMANDS" -- is exactly wrong
+    for it."""
+    report = lint_latex("The wavelength is $400 \\mathrmmathrm{~nm}$ here.\n")
+
+    assert "doubled-command" in _checks(report.findings, Severity.AUTO_FIX)
+    assert "unknown-command" not in _checks(report.findings, Severity.REVIEW)
+
+
+def test_a_command_written_twice_with_both_backslashes_is_caught_and_repaired() -> None:
+    """Regression: `\\section\\section{...}` stopped a real build with "TeX
+    capacity exceeded" -- the `\\sectionsection` check could not see it."""
+    text = "\\section\\section{Effect of Magnetic Media}\nA pellet of $1 \\mathrm\\mathrm{mm}$.\n"
+    report = lint_latex(text)
+
+    doubled = [f for f in report.findings if f.check == "doubled-command"]
+    assert [f.line for f in doubled] == [1, 2]
+    assert all(f.severity is Severity.AUTO_FIX for f in doubled)
+
+    fixed, count = apply_auto_fixes(text)
+    assert count == 2
+    assert fixed == "\\section{Effect of Magnetic Media}\nA pellet of $1 \\mathrm{mm}$.\n"
+
+
+def test_legitimately_repeated_commands_are_left_alone() -> None:
+    text = "$f^{\\prime\\prime}$, $|\\Psi|^2 = \\Psi\\Psi^{*}$, $\\bar\\bar{x}\\quad\\quad y$\n"
+
+    assert "doubled-command" not in _checks(lint_latex(text).findings)
+    assert apply_auto_fixes(text) == (text, 0)
+
+
+def test_a_markdown_heading_left_in_the_latex_is_flagged() -> None:
+    """Regression: three `### 2. ...` summary items reached a real build, and
+    `#` at the start of a line is TeX's macro-parameter character."""
+    report = lint_latex(
+        "Some text.\n\n### 2. Electron Spin and Spin-Orbit Coupling\n\nMore text.\n"
+    )
+
+    headings = [f for f in report.findings if f.check == "markdown-heading"]
+    assert len(headings) == 1
+    assert headings[0].line == 3
+    assert headings[0].severity is Severity.REVIEW
+
+
+def test_an_escaped_or_commented_hash_is_not_a_markdown_heading() -> None:
+    report = lint_latex("Item \\# 3 in the list.\n% ## a note to self\n\\#1 fan\n")
+
+    assert "markdown-heading" not in _checks(report.findings)
+
+
+def test_a_starred_heading_with_a_number_is_reported_not_stripped() -> None:
+    """LaTeX does not number `\\subsection*`, so the number is not duplicated;
+    on a real book these were summary list items parsed as headings."""
+    text = "\\subsection*{4. Magnetic Field Intensity Vector}\n"
+    report = lint_latex(text)
+
+    assert "duplicated-number" not in _checks(report.findings)
+    assert "numbered-starred-heading" in _checks(report.findings, Severity.REVIEW)
+    assert apply_auto_fixes(text) == (text, 0)
+
+
+def test_a_command_whose_package_is_not_loaded_is_flagged() -> None:
+    """Regression: `\\multirow` in a translated table stopped a real build;
+    the preamble never loaded the package."""
+    text = "\\begin{tabular}{ll}\n\\multirow{2}{*}{Diamagnetic} & Bismuth \\\\\n\\end{tabular}\n"
+    # The commented-out line must not count as loading it.
+    preamble = "\\usepackage{amsmath, booktabs}\n% \\usepackage{multirow}\n"
+
+    missing = [
+        f for f in lint_latex(text, preamble=preamble).findings if f.check == "missing-package"
+    ]
+    assert len(missing) == 1
+    assert missing[0].line == 2
+    assert "\\usepackage{multirow}" in missing[0].message
+
+    loaded = "\\usepackage[table]{array,multirow}\n"
+    assert "missing-package" not in _checks(lint_latex(text, preamble=loaded).findings)
+    # A lone fragment has no preamble to check against.
+    assert "missing-package" not in _checks(lint_latex(text).findings)
+
+
+def test_a_command_the_preamble_defines_itself_needs_no_package() -> None:
+    preamble = "\\newcommand{\\degree}{\\ensuremath{^\\circ}}\n"
+
+    report = lint_latex("It is $30\\degree$ warm.\n", preamble=preamble)
+    assert "missing-package" not in _checks(report.findings)
+
+
+def test_a_text_mode_command_inside_math_is_flagged() -> None:
+    """Regression: `^{\\textcircled{1}}` footnote markers inside equations."""
+    report = lint_latex("\\[\nE = 10 \\mathrm{nm} ^ {\\textcircled {1}}\n\\]\n")
+
+    assert "text-command-in-math" in _checks(report.findings, Severity.REVIEW)
+
+
+def test_a_text_mode_command_wrapped_in_text_or_in_prose_is_fine() -> None:
+    report = lint_latex(
+        "Regions \\textcircled{1} and \\textcircled{2}.\n\n$x^{\\text{\\textcircled{1}}}$\n"
+    )
+
+    assert "text-command-in-math" not in _checks(report.findings)
+
+
+BOOK_PREAMBLE = "\\mainmatter\n\\setcounter{chapter}{11}\n"
+
+
+def test_a_supplementary_reading_numbered_as_a_chapter_is_caught() -> None:
+    """Regression: five readings and a part heading came through as numbered
+    chapters, so a real book printed "Chapter 24" over chapter 22."""
+    text = (
+        "\\chapter{Electrostatic Field}\n\\begin{equation}F\\tag{12.1}\\end{equation}\n"
+        "\\chapter{Atmospheric Electricity}\nNo equations here.\n"
+        "\\chapter{Dielectrics}\n\\begin{equation}P\\tag{13.1}\\end{equation}\n"
+        "\\begin{equation}D\\tag{13.2}\\end{equation}\n"
+    )
+
+    drift = [
+        f for f in lint_latex(text, preamble=BOOK_PREAMBLE).findings
+        if f.check == "chapter-numbering"
+    ]
+    assert len(drift) == 1
+    assert drift[0].line == 5
+    assert "chapter 14" in drift[0].message and "13.x" in drift[0].message
+    assert "Atmospheric Electricity" in drift[0].message
+
+    fixed = text.replace("\\chapter{Atmospheric", "\\chapter*{Atmospheric")
+    report = lint_latex(fixed, preamble=BOOK_PREAMBLE)
+    assert "chapter-numbering" not in _checks(report.findings)
+
+
+def test_chapter_numbering_is_not_checked_without_a_preamble() -> None:
+    """A lone fragment does not start at the book's first chapter."""
+    report = lint_latex("\\chapter{Dielectrics}\n\\begin{equation}P\\tag{15.1}\\end{equation}\n")
+
+    assert "chapter-numbering" not in _checks(report.findings)
+
+
+def test_a_genuinely_unknown_command_is_still_reported() -> None:
+    report = lint_latex("$\\frobnicate{x}$\n")
+
+    assert "unknown-command" in _checks(report.findings, Severity.REVIEW)
+
+
 def test_preamble_leakage_into_a_chunk_is_flagged() -> None:
     report = lint_latex(
         "\\documentclass{book}\n\\usepackage{amsmath}\n"
@@ -490,6 +801,26 @@ def test_expansion_outlier_stays_quiet_on_a_consistent_book(tmp_path: Path) -> N
         (kit / "translated" / f"{index:03d}.tex").write_text(
             TRANSLATED_CHUNK, encoding="utf-8"
         )
+
+    assert [f for f in lint_kit(kit).findings if f.check == "truncated-chunk"] == []
+
+
+def test_expansion_outlier_is_not_fooled_by_a_math_heavy_chunk(tmp_path: Path) -> None:
+    """Regression: a real chunk that was mostly formulas and tables expanded
+    0.93x against a book median of 2.66x -- math does not grow when prose is
+    translated -- and was reported as cut off though it was complete."""
+    kit = tmp_path / "kit"
+    (kit / "chunks").mkdir(parents=True)
+    (kit / "translated").mkdir(parents=True)
+
+    formulas = "E = \\frac{q}{4 \\pi \\varepsilon_0 r^2} + \\sum_i E_i \\\\\n" * 200
+    for index in range(1, 6):
+        source, translation = UNTRANSLATED_CHUNK, TRANSLATED_CHUNK
+        if index == 3:
+            source += f"\n$$\n{formulas}$$\n"
+            translation += f"\n\\[\n{formulas}\\]\n"
+        (kit / "chunks" / f"{index:03d}.md").write_text(source, encoding="utf-8")
+        (kit / "translated" / f"{index:03d}.tex").write_text(translation, encoding="utf-8")
 
     assert [f for f in lint_kit(kit).findings if f.check == "truncated-chunk"] == []
 

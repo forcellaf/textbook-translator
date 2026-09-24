@@ -272,6 +272,21 @@ def test_assemble_strips_a_wrapping_latex_fence(tmp_path: Path) -> None:
     assert "```" not in assembled.read_text(encoding="utf-8")
 
 
+def test_assemble_marks_where_each_fragment_starts(tmp_path: Path) -> None:
+    """The marker lets a build error at line 6,532 of the book be reported
+    as translated/008.tex:39. The fence line is stripped, so the body of a
+    fenced reply starts on its line 2."""
+    kit = _seed_kit(tmp_path)
+    _translate(kit, wrap=lambda body: f"```latex\n{body}\n```")
+
+    assembled, _ = assemble(kit)
+    lines = assembled.read_text(encoding="utf-8").split("\n")
+
+    marker = lines.index("% >>> translated/001.tex:2")
+    assert lines[marker + 1] == "\\section{Part 1}"
+    assert "% >>> translated/002.tex:2" in lines
+
+
 # ── Packaging ───────────────────────────────────────────────────────────────
 
 

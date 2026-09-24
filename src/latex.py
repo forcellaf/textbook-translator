@@ -41,12 +41,24 @@ SYSTEM_PROMPT_PATH: Path = ASSETS_DIR / "system_prompt_latex.txt"
 GLOSSARY_PLACEHOLDER = "{{BOOK_CONTEXT_AND_GLOSSARY}}"
 
 # Every environment the preamble actually defines, plus the LaTeX built-ins it
-# loads packages for. Anything else is "! LaTeX Error: Environment X undefined"
-# at compile time -- during testing the model invented `solution` and
-# `theorem`. Starred variants (equation*, align*) are accepted: the check
-# below strips the star before comparing.
+# Everything that is actually defined when the preamble has been read.
+# Anything else is "! LaTeX Error: Environment X undefined" at compile time --
+# during testing the model invented `solution` and `theorem`, neither of which
+# exists here (amsthm is not loaded; `example` and `exercise` come from the two
+# \newtheorem lines in the preamble).
+#
+# The second group is the reason this list is longer than the one the system
+# prompt gives the model. The prompt tells it which environments to *structure*
+# the translation with; mathematics is copied through verbatim, so whatever the
+# source used arrives untouched. A real book came back with ~1,000 legitimate
+# `\begin{array}` blocks inside display math -- array is LaTeX kernel and
+# compiles fine, so flagging it was pure noise that gated the build.
+#
+# Starred variants (equation*, align*, tabular*) are accepted: the check below
+# strips the star before comparing.
 DEFINED_ENVIRONMENTS: frozenset[str] = frozenset(
     {
+        # Defined by assets/preamble.tex, or structural LaTeX the prompt asks for
         "example",
         "exercise",
         "figure",
@@ -60,6 +72,33 @@ DEFINED_ENVIRONMENTS: frozenset[str] = frozenset(
         "minipage",
         "document",
         "longtable",
+        # LaTeX kernel and amsmath, both loaded: available whether the prompt
+        # mentions them or not, so they cannot fail to compile.
+        "array",
+        "cases",
+        "split",
+        "aligned",
+        "gathered",
+        "gather",
+        "multline",
+        "eqnarray",
+        "displaymath",
+        "math",
+        "subequations",
+        "matrix",
+        "pmatrix",
+        "bmatrix",
+        "Bmatrix",
+        "vmatrix",
+        "Vmatrix",
+        "smallmatrix",
+        "description",
+        "quote",
+        "quotation",
+        "verbatim",
+        "flushleft",
+        "flushright",
+        "tabbing",
     }
 )
 
@@ -93,6 +132,17 @@ def load_preamble(path: Path | None = None) -> str:
             "rather than generating one."
         )
     return path.read_text(encoding="utf-8")
+
+
+_CHAPTER_COUNTER_RE = re.compile(r"^[^%\n]*\\setcounter\s*\{chapter\}\s*\{(\d+)\}", re.MULTILINE)
+
+
+def preamble_first_chapter(preamble: str) -> int:
+    """The number LaTeX gives the first ``\\chapter``: one past the
+    preamble's ``\\setcounter{chapter}{N}``, which this corpus uses because a
+    volume starts partway through the book. Commented-out lines don't count."""
+    match = _CHAPTER_COUNTER_RE.search(preamble)
+    return int(match.group(1)) + 1 if match else 1
 
 
 def build_system_prompt(profile: BookProfile | None = None, *, path: Path | None = None) -> str:
@@ -363,6 +413,7 @@ __all__ = [
     "build_system_prompt",
     "find_preamble_leakage",
     "load_preamble",
+    "preamble_first_chapter",
     "scan_environments",
     "validate_fragment",
 ]

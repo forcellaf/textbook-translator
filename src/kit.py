@@ -49,6 +49,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.build import chunk_marker
 from src.config import KIT_CHUNK_CHARS
 from src.latex import assemble_document, build_system_prompt
 from src.lint import IMG_TOKEN_RE, TRANSLATED_SUFFIX, latex_image_refs, strip_wrapping_fence
@@ -279,7 +280,14 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
         if not target_path.exists():
             problems.append(f"chunk {source_path.stem} has no translation saved")
             continue
-        parts.append(strip_wrapping_fence(target_path.read_text(encoding="utf-8")).strip())
+        raw = target_path.read_text(encoding="utf-8")
+        body = strip_wrapping_fence(raw).strip()
+        # A comment naming the fragment and the line its body starts on, so
+        # an error at line 6,532 of the assembled book can be reported as
+        # translated/008.tex:39 -- see `src.build.collect_errors`.
+        first_line = raw[: raw.find(body)].count("\n") + 1 if body else 1
+        label = f"{TRANSLATED_DIRNAME}/{target_path.name}"
+        parts.append(f"{chunk_marker(label, first_line)}\n{body}")
 
     merged = "\n\n".join(parts)
 

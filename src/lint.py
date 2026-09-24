@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -52,6 +53,8 @@ from src.latex import (
     DEFINED_ENVIRONMENTS,
     brace_imbalance,
     find_preamble_leakage,
+    load_preamble,
+    preamble_first_chapter,
     scan_environments,
 )
 from src.normalize import (
@@ -171,6 +174,26 @@ longmapsto hookrightarrow hookleftarrow rightsquigarrow between
 """.split()
 )
 
+# Structural commands, which `KNOWN_COMMANDS` deliberately does not cover:
+# that list is a *math* vocabulary, checked only inside math spans.
+#
+# The doubled-command check needs these as well. `\sectionsection` is exactly
+# the same defect as `\mathrmmathrm`, and it reached a real build and stopped
+# it -- five times across four chunks -- because `section` was not in any list
+# the check consulted, so nothing reported it and nothing repaired it.
+_STRUCTURE_COMMANDS: frozenset[str] = frozenset(
+    """
+chapter section subsection subsubsection paragraph subparagraph part
+caption label ref eqref item textbf textit texttt textrm emph underline
+centering raggedright raggedleft footnote textsuperscript textsubscript
+bookfig bookfigtwo includegraphics begin end
+""".split()
+)
+
+# What a doubled command may be repaired to: anything this module recognises
+# in either vocabulary.
+_REPAIRABLE_COMMANDS: frozenset[str] = KNOWN_COMMANDS | _STRUCTURE_COMMANDS
+
 # Commands that take a braced argument. One of these sitting at the very end
 # of a math span has lost its argument -- "! Missing } inserted."
 _ARGUMENT_COMMANDS: frozenset[str] = frozenset(
@@ -183,8 +206,89 @@ underset color textcolor mbox hbox
 """.split()
 )
 
+# Commands that are never meaningfully written twice in a row, so
+# `\section\section{...}` or `\mathrm\mathrm{mm}` can only be damage. The
+# second spelling of the doubled-command defect: the first (`\sectionsection`)
+# drops the inner backslash, this one keeps it, and it stopped a real build
+# the same way. Deliberately excludes accents and operators -- `\bar\bar{x}`,
+# `\prime\prime`, `\Psi\Psi^*` and `\quad\quad` are all legitimate.
+_NEVER_REPEATED_COMMANDS: frozenset[str] = frozenset(
+    """
+    mathrm mathbf mathit mathcal mathbb mathfrak mathsf mathtt mathscr
+    boldsymbol pmb operatorname text textbf textit textrm textsf texttt emph
+    mbox chapter section subsection subsubsection paragraph subparagraph part
+    caption label textsuperscript textsubscript centering bookfig bookfigtwo
+    includegraphics
+    """.split()
+)
+
+# Commands that need a package, and the package(s) that provide them. A
+# model reproducing a source table reaches for `\multirow` whether or not the
+# preamble loads it, and the result is "! Undefined control sequence." with
+# nothing in the text looking wrong. Not exhaustive -- only commands a
+# textbook translation plausibly emits.
+_PACKAGE_FOR_COMMAND: dict[str, tuple[str, ...]] = {
+    "multirow": ("multirow",),
+    "makecell": ("makecell",),
+    "thead": ("makecell",),
+    "cancel": ("cancel",),
+    "bcancel": ("cancel",),
+    "xcancel": ("cancel",),
+    "SI": ("siunitx",),
+    "si": ("siunitx",),
+    "num": ("siunitx",),
+    "qty": ("siunitx",),
+    "unit": ("siunitx",),
+    "ce": ("mhchem",),
+    "mathscr": ("mathrsfs",),
+    "ding": ("pifont",),
+    "bm": ("bm",),
+    "uline": ("ulem",),
+    "uwave": ("ulem",),
+    "sout": ("ulem",),
+    "hl": ("soul",),
+    "cellcolor": ("colortbl", "xcolor"),
+    "rowcolor": ("colortbl", "xcolor"),
+    "color": ("color", "xcolor"),
+    "textcolor": ("color", "xcolor"),
+    "degree": ("gensymb",),
+    "celsius": ("gensymb",),
+    "ohm": ("gensymb", "siunitx"),
+    "micro": ("gensymb", "siunitx"),
+    "upmu": ("upgreek",),
+    "coloneqq": ("mathtools",),
+    "mathclap": ("mathtools",),
+    "toprule": ("booktabs",),
+    "midrule": ("booktabs",),
+    "bottomrule": ("booktabs",),
+    "url": ("url", "hyperref"),
+    "href": ("hyperref",),
+}
+
+# Text-mode commands that do not work in math: LaTeX warns "Command
+# \textcircled invalid in math mode" and typesets something else. Four came
+# through a real build, from source footnote markers like `^{\textcircled{1}}`.
+_TEXT_ONLY_COMMANDS: frozenset[str] = frozenset(
+    "textcircled textsuperscript textsubscript textdegree textmu".split()
+)
+
+# Groups inside math that switch back to text mode, where the commands above
+# are fine: `$\text{\textcircled{1}}$` is the correct spelling.
+_TEXT_GROUP_RE = re.compile(r"\\(?:text|textrm|textbf|textit|mbox|hbox)\s*\{")
+
 _COMMAND_RE = re.compile(r"\\([A-Za-z]+)")
 _DOUBLED_COMMAND_RE = re.compile(r"\\([A-Za-z]+?)\1(?![A-Za-z])")
+_REPEATED_COMMAND_RE = re.compile(r"\\([A-Za-z]+)(?:\s*\\\1(?![A-Za-z]))+")
+_USEPACKAGE_RE = re.compile(r"\\usepackage\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}")
+_DEFINED_COMMAND_RE = re.compile(
+    r"\\(?:newcommand|renewcommand|providecommand|DeclareMathOperator)\*?\s*\{?\\([A-Za-z]+)"
+    r"|\\def\s*\\([A-Za-z]+)"
+)
+_CHAPTER_RE = re.compile(r"\\chapter(\*?)\s*(?:\[[^\]]*\])?\s*\{")
+_CHAPTER_TAG_RE = re.compile(r"\\tag\s*\{\s*(\d+)\.\d+")
+# A Markdown heading left in the LaTeX. At the start of a line `#` is TeX's
+# macro-parameter character: "! You can't use `macro parameter character #'".
+_MARKDOWN_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+\S.*$", re.MULTILINE)
 _ARRAY_RE = re.compile(r"\\begin\{(array|tabular)\}\s*\{([^}]*)\}(.*?)\\end\{\1\}", re.DOTALL)
 _TAG_RE = re.compile(r"\\tag\s*\*?\s*\{([^}]*)\}")
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)")
@@ -215,7 +319,7 @@ _MATH_ENV_RE = re.compile(
 
 # Sectioning and caption commands whose argument LaTeX numbers by itself.
 _NUMBERED_ARG_RE = re.compile(
-    r"\\(chapter|section|subsection|subsubsection|caption)\*?(?:\[[^\]]*\])?\{"
+    r"\\(chapter|section|subsection|subsubsection|caption)(\*?)(?:\[[^\]]*\])?\{"
 )
 
 # A source number (or a "Figure"/"Table" label) the model copied into an
@@ -526,22 +630,43 @@ def _check_unknown_commands(text: str) -> list[Finding]:
     ]
 
 
-def _check_doubled_commands(text: str) -> list[Finding]:
-    """A known command written twice with one backslash (``\\mathrmmathrm``).
+def _is_doubled_command(name: str) -> bool:
+    """``"mathrmmathrm"`` -> True. A known command written twice over one
+    backslash, which ``_check_doubled_commands`` reports and repairs."""
+    half, odd = divmod(len(name), 2)
+    return not odd and name[:half] == name[half:] and name[:half] in _REPAIRABLE_COMMANDS
 
-    The only auto-fixable defect here: it cannot be anything but damage, and
-    the repair is unambiguous.
+
+def _check_doubled_commands(text: str) -> list[Finding]:
+    """A known command written twice: over one backslash (``\\mathrmmathrm``),
+    or with both backslashes (``\\section\\section``).
+
+    Auto-fixable: it cannot be anything but damage, and the repair is
+    unambiguous. The second form is limited to `_NEVER_REPEATED_COMMANDS`,
+    because ``\\prime\\prime`` and ``\\bar\\bar{x}`` are real LaTeX.
     """
     findings: list[Finding] = []
     for lineno, line in enumerate(text.split("\n"), start=1):
         for match in _DOUBLED_COMMAND_RE.finditer(line):
-            if match.group(1) in KNOWN_COMMANDS:
+            if match.group(1) in _REPAIRABLE_COMMANDS:
                 findings.append(
                     Finding(
                         "doubled-command",
                         Severity.AUTO_FIX,
                         f"\\{match.group(1)} is doubled ({match.group(0)}) -- "
                         "'! Undefined control sequence.'",
+                        lineno,
+                        _excerpt(line),
+                    )
+                )
+        for match in _REPEATED_COMMAND_RE.finditer(line):
+            if match.group(1) in _NEVER_REPEATED_COMMANDS:
+                findings.append(
+                    Finding(
+                        "doubled-command",
+                        Severity.AUTO_FIX,
+                        f"\\{match.group(1)} is written twice ({match.group(0)}) -- the "
+                        "first one takes the second as its argument, which stops the build",
                         lineno,
                         _excerpt(line),
                     )
@@ -742,16 +867,48 @@ def _braced_argument(text: str, open_index: int) -> tuple[str, int] | None:
     return None
 
 
-def _iter_numbered_arguments(text: str):
+def _iter_numbered_arguments(text: str, *, starred: bool = False):
     """``(command, argument, start, end, line)`` for each sectioning/caption
-    argument LaTeX numbers by itself."""
+    argument LaTeX numbers by itself -- or, with ``starred=True``, for each
+    starred one, which LaTeX does not number."""
     for match in _NUMBERED_ARG_RE.finditer(text):
+        if bool(match.group(2)) != starred:
+            continue
         found = _braced_argument(text, match.end() - 1)
         if found is None:
             continue
         argument, end = found
         line = text.count("\n", 0, match.start()) + 1
         yield match.group(1), argument, match.end() - 1, end, line
+
+
+def _check_numbered_starred_headings(text: str) -> list[Finding]:
+    """A starred heading whose title starts with a number.
+
+    LaTeX does not number ``\\subsection*``, so nothing is duplicated -- but
+    on a real book every one of these was a numbered list item in a chapter
+    summary ("4. Magnetic Field Intensity Vector") that MinerU had parsed as
+    a heading. Its siblings stayed plain "1. ...", "2. ..." paragraphs, so
+    the PDF showed item 4 as a bold heading in the middle of a list. Which
+    form is right depends on the book, so this only reports.
+    """
+    findings: list[Finding] = []
+    for command, argument, _start, _end, line in _iter_numbered_arguments(text, starred=True):
+        match = _LEADING_NUMBER_RE.match(argument)
+        if not match or command == "caption":
+            continue
+        findings.append(
+            Finding(
+                "numbered-starred-heading",
+                Severity.REVIEW,
+                f"\\{command}* starts with the number {match.group().strip()!r}. This is "
+                "usually a numbered list item the parser turned into a heading; if "
+                "its neighbours are plain numbered paragraphs, make it one too",
+                line,
+                _excerpt(f"\\{command}*{{{argument}}}"),
+            )
+        )
+    return findings[:_MAX_EXAMPLES]
 
 
 def _check_duplicated_numbers(text: str) -> list[Finding]:
@@ -763,7 +920,8 @@ def _check_duplicated_numbers(text: str) -> list[Finding]:
     nothing fails, which is exactly why it has to be checked.
 
     Auto-fixable: the pattern is unambiguous, and the repair is to delete the
-    number.
+    number. Starred headings are skipped: LaTeX does not number them, so
+    there is nothing to duplicate (see `_check_numbered_starred_headings`).
     """
     findings: list[Finding] = []
     for command, argument, _start, _end, line in _iter_numbered_arguments(text):
@@ -778,6 +936,230 @@ def _check_duplicated_numbers(text: str) -> list[Finding]:
                 "LaTeX numbers it, so the PDF shows the number twice",
                 line,
                 _excerpt(f"\\{command}{{{argument}}}"),
+            )
+        )
+    return findings
+
+
+# Characters above Latin-1 that `inputenc`'s utf8 support does define, so
+# pdflatex typesets them rather than stopping: the General Punctuation that
+# maps onto a real font glyph. Everything above U+00FF that is not here is
+# "! LaTeX Error: Unicode character X not set up for use with LaTeX."
+_TYPESETTABLE_PUNCTUATION: frozenset[str] = frozenset(
+    "–—‘’‚“”„"
+    "†‡•…‰‹›"
+)
+
+# Invisible characters that carry no meaning at all. They survive a copy out
+# of a chat window and are impossible to see in an editor, and each one is a
+# fatal pdflatex error -- so deleting them is the only possible repair.
+_ZERO_WIDTH: frozenset[str] = frozenset("​‌‍⁠﻿")
+
+_LATIN1_CEILING = 0xFF
+
+
+def _untypesettable_characters(text: str) -> dict[str, list[int]]:
+    """``{character: [line, ...]}`` for everything pdflatex cannot typeset."""
+    found: dict[str, list[int]] = {}
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        for char in line:
+            if ord(char) <= _LATIN1_CEILING or char in _TYPESETTABLE_PUNCTUATION:
+                continue
+            found.setdefault(char, []).append(lineno)
+    return found
+
+
+def _check_unicode_characters(text: str) -> list[Finding]:
+    """Literal Unicode the model emitted instead of a LaTeX command.
+
+    A real book came back with 482 of these across 60 distinct characters:
+    ``ε`` for ``$\\varepsilon$``, ``−`` (U+2212) for a math minus, ``θ``,
+    ``①``, six stray Chinese characters, and 94 zero-width spaces. Under
+    pdflatex + inputenc every single one is fatal, **one error per compile** --
+    which is 482 build cycles to find them by compiling.
+
+    The CJK ones overlap with ``cjk-residue``, but that check measures a
+    *ratio*: six characters in a 700,000-character book is 0.01%, far below
+    any sane residue threshold, and still six dead builds.
+    """
+    found = _untypesettable_characters(text)
+    if not found:
+        return []
+
+    findings: list[Finding] = []
+    for char, lines in sorted(found.items(), key=lambda kv: -len(kv[1])):
+        name = unicodedata.name(char, "unnamed character")
+        zero_width = char in _ZERO_WIDTH
+        findings.append(
+            Finding(
+                "zero-width-character" if zero_width else "unicode-character",
+                Severity.AUTO_FIX if zero_width else Severity.REVIEW,
+                (
+                    f"invisible U+{ord(char):04X} ({name}) appears {len(lines)}x and "
+                    "cannot be typeset; it carries no meaning, so it is deleted"
+                    if zero_width
+                    else f"literal '{char}' (U+{ord(char):04X}, {name}) appears "
+                    f"{len(lines)}x -- pdflatex cannot typeset it. Replace it with "
+                    "the LaTeX it stands for, or build with XeLaTeX (see the "
+                    "commented swap in assets/preamble.tex)"
+                ),
+                lines[0],
+                f"also on line(s): {', '.join(str(n) for n in lines[1:6])}"
+                if len(lines) > 1
+                else "",
+            )
+        )
+    return findings[:_MAX_EXAMPLES]
+
+
+def strip_zero_width(text: str) -> tuple[str, int]:
+    """Delete zero-width characters. Returns ``(text, count)``."""
+    count = sum(text.count(char) for char in _ZERO_WIDTH)
+    if not count:
+        return text, 0
+    for char in _ZERO_WIDTH:
+        text = text.replace(char, "")
+    return text, count
+
+
+# Unnumbered display math, in both spellings the translation uses.
+_DISPLAY_BLOCK_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("$$ ... $$", re.compile(r"\$\$(.*?)\$\$", re.DOTALL)),
+    ("\\[ ... \\]", re.compile(r"\\\[(.*?)\\\]", re.DOTALL)),
+)
+
+
+def _check_misplaced_tags(text: str) -> list[Finding]:
+    """``\\tag`` inside display math that cannot carry one.
+
+    amsmath allows ``\\tag`` only in an equation-like environment; in
+    ``$$...$$`` or ``\\[...\\]`` it is "! Package amsmath Error: \\tag not
+    allowed here." The reference book tags 570 of its equations and the
+    prompt says to keep every tag, so this arrives whenever the model picks
+    the unnumbered form for one of them.
+
+    Auto-fixable: a tag *is* the book's equation number, so the block is a
+    numbered equation written in the wrong wrapper. Promoting it to
+    ``equation`` is the repair the prompt already asks for.
+    """
+    findings: list[Finding] = []
+    for label, pattern in _DISPLAY_BLOCK_RES:
+        for match in pattern.finditer(text):
+            tags = _TAG_RE.findall(match.group(1))
+            if not tags:
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            if len(tags) > 1:
+                # Two tags is a different defect, and not this one's to fix:
+                # amsmath rejects the second one wherever the block ends up,
+                # and choosing between them means looking at the book.
+                findings.append(
+                    Finding(
+                        "multiple-tags",
+                        Severity.REVIEW,
+                        f"{label} carries {len(tags)} \\tag commands "
+                        f"({', '.join(repr(t) for t in tags)}); amsmath allows one. "
+                        "Delete whichever is not the real equation number.",
+                        line,
+                        _excerpt(match.group(1)),
+                    )
+                )
+                continue
+            findings.append(
+                Finding(
+                    "misplaced-tag",
+                    Severity.AUTO_FIX,
+                    f"\\tag{{{tags[0]}}} sits in {label}, which cannot carry one -- "
+                    "'! Package amsmath Error: \\tag not allowed here.' The block is "
+                    "a numbered equation, so it becomes \\begin{equation}",
+                    line,
+                    _excerpt(match.group(1)),
+                )
+            )
+    return findings[:_MAX_EXAMPLES]
+
+
+def promote_tagged_display(text: str) -> tuple[str, int]:
+    """Wrap tagged display blocks in ``equation``. Returns ``(text, count)``."""
+    count = 0
+
+    def repair(match: re.Match[str]) -> str:
+        nonlocal count
+        body = match.group(1)
+        # Exactly one tag. A block carrying two is broken in a way that
+        # promoting it does not fix -- amsmath rejects the second tag inside
+        # `equation` as well -- so it is left for the human it needs.
+        if len(_TAG_RE.findall(body)) != 1:
+            return match.group(0)
+        count += 1
+        return f"\\begin{{equation}}{body}\\end{{equation}}"
+
+    for _label, pattern in _DISPLAY_BLOCK_RES:
+        text = pattern.sub(repair, text)
+    return text, count
+
+
+def _bare_display_delimiters(text: str) -> list[tuple[int, str]]:
+    """``(line, "[" or "]")`` for every line that is nothing but a bracket.
+
+    A display block opened with ``[`` instead of ``\\[``. Measured on a real
+    book: 971 blocks correct, **94 with the backslash dropped** -- so LaTeX
+    typesets a literal bracket and runs the mathematics after it in text
+    mode, which fails on the first ``\\frac``. A lone bracket on its own line
+    is never anything else; a bracket in prose sits inside a sentence.
+    """
+    return [
+        (lineno, line.strip())
+        for lineno, line in enumerate(text.split("\n"), start=1)
+        if line.strip() in ("[", "]")
+    ]
+
+
+def _delimiters_are_repairable(hits: list[tuple[int, str]]) -> bool:
+    """True when the bare brackets strictly alternate ``[``, ``]``, ``[`` ...
+
+    Anything else -- an unpaired opener, two in a row -- means guessing which
+    bracket belongs to which block, so those are reported instead.
+    """
+    return bool(hits) and all(
+        bracket == ("[" if index % 2 == 0 else "]")
+        for index, (_line, bracket) in enumerate(hits)
+    )
+
+
+def _check_display_delimiters(text: str) -> list[Finding]:
+    hits = _bare_display_delimiters(text)
+    if not hits:
+        return []
+
+    repairable = _delimiters_are_repairable(hits)
+    severity = Severity.AUTO_FIX if repairable else Severity.REVIEW
+    detail = (
+        "lost its backslash"
+        if repairable
+        else "lost its backslash, and the brackets do not pair up, so the repair "
+        "needs a human"
+    )
+    findings = [
+        Finding(
+            "display-delimiter",
+            severity,
+            f"a line containing only `{bracket}` -- a display-math `\\{bracket}` "
+            f"that {detail}; the mathematics after it runs in text mode",
+            lineno,
+        )
+        for lineno, bracket in hits[:_MAX_EXAMPLES]
+    ]
+    if len(hits) > _MAX_EXAMPLES:
+        # Without this the summary line reads "12 auto-fixable" and `--fix`
+        # then reports repairing 188 -- on a real book this check fires in the
+        # hundreds, and the cap is per-check, not per-book.
+        findings.append(
+            Finding(
+                "display-delimiter",
+                severity,
+                f"... and {len(hits) - _MAX_EXAMPLES} more bare `[` / `]` line(s), "
+                f"{len(hits)} in total",
             )
         )
     return findings
@@ -809,7 +1191,12 @@ def _check_latex_unknown_commands(text: str) -> list[Finding]:
     for span in iter_latex_math_spans(text):
         for match in _COMMAND_RE.finditer(span.body):
             name = match.group(1)
-            if name in KNOWN_COMMANDS:
+            if name in KNOWN_COMMANDS or _is_doubled_command(name):
+                # A doubled command (\mathrmmathrm) is unknown by definition,
+                # but `_check_doubled_commands` already owns it and can repair
+                # it. Reporting it here too would gate the build on a defect
+                # `--fix` clears, under the advice "add it to KNOWN_COMMANDS",
+                # which is the one thing that must not happen to it.
                 continue
             counts[name] = counts.get(name, 0) + 1
             seen.setdefault(name, (span.line, _excerpt(span.body)))
@@ -829,6 +1216,185 @@ def _check_latex_unknown_commands(text: str) -> list[Finding]:
         )
         for name, count in ordered[:_MAX_EXAMPLES]
     ]
+
+
+def _check_markdown_headings(text: str) -> list[Finding]:
+    """A Markdown heading the model passed through instead of converting.
+
+    Three reached a real build, and each stopped it: at the start of a line
+    ``#`` is TeX's macro-parameter character. All three were numbered summary
+    items ("### 2. Electron Spin ...") that MinerU had parsed as headings, so
+    the right repair depends on context and this only reports.
+    """
+    findings = [
+        Finding(
+            "markdown-heading",
+            Severity.REVIEW,
+            f"a Markdown `{match.group(1)}` heading in the LaTeX -- '! You can't use "
+            "`macro parameter character #' in vertical mode.' Convert it to \\section/\\subsection, or "
+            "to a plain numbered paragraph if it is a list item",
+            text.count("\n", 0, match.start()) + 1,
+            _excerpt(match.group(0)),
+        )
+        for match in _MARKDOWN_HEADING_RE.finditer(_COMMENT_RE.sub("", text))
+    ]
+    return findings[:_MAX_EXAMPLES]
+
+
+def _preamble_provides(preamble: str) -> tuple[set[str], set[str]]:
+    """``(packages loaded, commands defined)`` by ``preamble``, ignoring
+    commented-out lines -- the XeLaTeX swap sits there as comments."""
+    live = _COMMENT_RE.sub("", preamble)
+    packages = {
+        name.strip()
+        for group in _USEPACKAGE_RE.findall(live)
+        for name in group.split(",")
+        if name.strip()
+    }
+    defined = {a or b for a, b in _DEFINED_COMMAND_RE.findall(live)}
+    return packages, defined
+
+
+def _check_required_packages(text: str, preamble: str | None) -> list[Finding]:
+    """A command whose package the preamble does not load.
+
+    ``\\multirow`` in a translated table stopped a real build: the text is
+    perfectly ordinary LaTeX, and only the preamble decides whether it
+    compiles. Skipped when no preamble is given (a lone fragment).
+    """
+    if preamble is None:
+        return []
+    packages, defined = _preamble_provides(preamble)
+
+    first_line: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    for lineno, line in enumerate(_COMMENT_RE.sub("", text).split("\n"), start=1):
+        for name in _COMMAND_RE.findall(line):
+            providers = _PACKAGE_FOR_COMMAND.get(name)
+            if providers is None or name in defined or packages.intersection(providers):
+                continue
+            first_line.setdefault(name, lineno)
+            counts[name] = counts.get(name, 0) + 1
+
+    return [
+        Finding(
+            "missing-package",
+            Severity.REVIEW,
+            f"\\{name} appears {counts[name]}x but the preamble does not load "
+            f"{' or '.join(_PACKAGE_FOR_COMMAND[name])} -- '! Undefined control "
+            f"sequence.' Add \\usepackage{{{_PACKAGE_FOR_COMMAND[name][0]}}} to "
+            "assets/preamble.tex",
+            line,
+        )
+        for name, line in sorted(first_line.items(), key=lambda kv: kv[1])
+    ][:_MAX_EXAMPLES]
+
+
+def _without_text_groups(body: str) -> str:
+    """``body`` with every ``\\text{...}``-style group removed, since text
+    mode inside math is exactly where text commands belong."""
+    pieces: list[str] = []
+    cursor = 0
+    for match in _TEXT_GROUP_RE.finditer(body):
+        if match.start() < cursor:
+            continue
+        found = _braced_argument(body, match.end() - 1)
+        if found is None:
+            continue
+        pieces.append(body[cursor : match.start()])
+        cursor = found[1]
+    pieces.append(body[cursor:])
+    return "".join(pieces)
+
+
+def _check_text_commands_in_math(text: str) -> list[Finding]:
+    """A text-mode command used directly in math (``^{\\textcircled{1}}``).
+
+    Not fatal -- LaTeX warns "Command \\textcircled invalid in math mode" and
+    carries on -- but what it typesets is not the symbol. Wrapping it in
+    ``\\text{...}`` is the fix.
+    """
+    findings: list[Finding] = []
+    for span in iter_latex_math_spans(text):
+        for name in _COMMAND_RE.findall(_without_text_groups(span.body)):
+            if name in _TEXT_ONLY_COMMANDS:
+                findings.append(
+                    Finding(
+                        "text-command-in-math",
+                        Severity.REVIEW,
+                        f"\\{name} is a text-mode command inside {span.kind} math -- "
+                        f"LaTeX typesets it wrongly. Wrap it: \\text{{\\{name}{{...}}}}, "
+                        "or delete it if it is a stray footnote marker",
+                        span.line,
+                        _excerpt(span.body),
+                    )
+                )
+    return findings[:_MAX_EXAMPLES]
+
+
+def _check_chapter_numbering(text: str, preamble: str | None) -> list[Finding]:
+    """Chapter numbers that drift away from the book's own equation tags.
+
+    Every ``\\tag{15.3}`` says which chapter the book thinks it is in, and
+    LaTeX's count of numbered ``\\chapter`` commands says which one the PDF
+    will print. On a real book they drifted by up to three: five
+    supplementary readings and one part heading ("Optics") had come through
+    as numbered chapters. Each one pushed every later chapter up by one, and
+    nothing failed -- the PDF just said "Chapter 24" over chapter 22.
+
+    Reports where each drift starts, naming the untagged chapters since the
+    last one that agreed -- the likely culprits. Needs the preamble for the
+    starting number, so a lone fragment is skipped.
+    """
+    if preamble is None:
+        return []
+
+    number = preamble_first_chapter(preamble)
+    matches = list(_CHAPTER_RE.finditer(text))
+    findings: list[Finding] = []
+    previous_drift = 0
+    suspects: list[str] = []
+    last_tagged = ""
+
+    for index, match in enumerate(matches):
+        if match.group(1):  # \chapter* takes no number
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        found = _braced_argument(text, match.end() - 1)
+        title = _excerpt(found[0], 60) if found else "?"
+
+        prefixes = [int(p) for p in _CHAPTER_TAG_RE.findall(text, match.end(), end)]
+        if not prefixes:
+            suspects.append(title)
+            number += 1
+            continue
+
+        tagged = max(set(prefixes), key=prefixes.count)
+        drift = number - tagged
+        if drift not in (previous_drift, 0):
+            cause = (
+                "an earlier \\chapter is probably a supplementary reading that should "
+                "be \\chapter*, or a \\part written as \\chapter"
+                if drift > 0
+                else "a chapter heading is probably missing, or was written as \\chapter*"
+            )
+            where = f"since '{last_tagged}'" if last_tagged else "before it"
+            candidates = f" Untagged chapters {where}: {', '.join(suspects)}." if suspects else ""
+            findings.append(
+                Finding(
+                    "chapter-numbering",
+                    Severity.REVIEW,
+                    f"\\chapter{{{title}}} will be printed as chapter {number}, but its "
+                    f"equations are tagged {tagged}.x -- {cause}.{candidates}",
+                    text.count("\n", 0, match.start()) + 1,
+                )
+            )
+        previous_drift = drift
+        last_tagged = title
+        suspects = []
+        number += 1
+
+    return findings[:_MAX_EXAMPLES]
 
 
 def latex_image_refs(text: str) -> list[str]:
@@ -882,7 +1448,9 @@ def _resolves(ref: str, base_dir: Path) -> bool:
     return (base_dir / ref).exists() or (base_dir / "images" / Path(ref).name).exists()
 
 
-def lint_latex(text: str, *, base_dir: Path | None = None) -> LintReport:
+def lint_latex(
+    text: str, *, base_dir: Path | None = None, preamble: str | None = None
+) -> LintReport:
     """Run every check that applies to translated LaTeX body text.
 
     Args:
@@ -892,16 +1460,28 @@ def lint_latex(text: str, *, base_dir: Path | None = None) -> LintReport:
             ``\\documentclass`` as leakage.
         base_dir: Directory figure paths resolve against. Omit to skip the
             on-disk check.
+        preamble: The preamble the body will be compiled with. Omit to skip
+            the checks that depend on it (loaded packages, the starting
+            chapter number) -- right for a lone fragment, which is neither a
+            whole book nor necessarily headed for this preamble.
     """
     findings: list[Finding] = []
     findings += _check_environments(text)
     findings += _check_preamble_leakage(text)
+    findings += _check_unicode_characters(text)
+    findings += _check_display_delimiters(text)
+    findings += _check_misplaced_tags(text)
     findings += _check_latex_braces(text)
     findings += _check_inline_parity(text)
     findings += _check_duplicated_numbers(text)
+    findings += _check_numbered_starred_headings(text)
+    findings += _check_markdown_headings(text)
     findings += _check_latex_dangling_commands(text)
     findings += _check_doubled_commands(text)
     findings += _check_latex_unknown_commands(text)
+    findings += _check_text_commands_in_math(text)
+    findings += _check_required_packages(text, preamble)
+    findings += _check_chapter_numbering(text, preamble)
     findings += _check_latex_image_paths(text, base_dir)
     return LintReport(findings)
 
@@ -938,23 +1518,60 @@ def lint_markdown(text: str, *, base_dir: Path | None = None) -> LintReport:
 def apply_auto_fixes(text: str) -> tuple[str, int]:
     """Apply only the provably safe repairs. Returns ``(text, count)``.
 
-    Two things qualify: a known command literally doubled, and a source
-    number repeated into a heading or caption LaTeX numbers itself. Both are
-    unambiguous -- they cannot be anything but damage, and the repair has one
-    possible form. Every other finding is reported for a human.
+    Three things qualify: a known command literally doubled, a source number
+    repeated into a heading or caption LaTeX numbers itself, and a display
+    delimiter that lost its backslash. Each is unambiguous -- it cannot be
+    anything but damage, and the repair has exactly one possible form. Every
+    other finding is reported for a human.
     """
     count = 0
 
     def repair(match: re.Match[str]) -> str:
         nonlocal count
         name = match.group(1)
-        if name not in KNOWN_COMMANDS:
+        if name not in _REPAIRABLE_COMMANDS:
+            return match.group(0)
+        count += 1
+        return f"\\{name}"
+
+    def collapse(match: re.Match[str]) -> str:
+        nonlocal count
+        name = match.group(1)
+        if name not in _NEVER_REPEATED_COMMANDS:
             return match.group(0)
         count += 1
         return f"\\{name}"
 
     text, stripped = strip_duplicated_numbers(text)
-    return _DOUBLED_COMMAND_RE.sub(repair, text), count + stripped
+    # Delimiters first: a block whose `\[` lost its backslash has to be put
+    # back together before it can be recognised as a tagged equation.
+    text, restored = restore_display_delimiters(text)
+    text, promoted = promote_tagged_display(text)
+    text, invisible = strip_zero_width(text)
+    text = _REPEATED_COMMAND_RE.sub(collapse, text)
+    return (
+        _DOUBLED_COMMAND_RE.sub(repair, text),
+        count + stripped + restored + promoted + invisible,
+    )
+
+
+def restore_display_delimiters(text: str) -> tuple[str, int]:
+    """Put the backslash back on bare ``[`` / ``]`` display delimiters.
+
+    Only when they strictly alternate across the whole document, so every
+    opener has its own closer. If they do not, nothing is touched and
+    ``_check_display_delimiters`` reports them for review instead.
+    """
+    hits = _bare_display_delimiters(text)
+    if not _delimiters_are_repairable(hits):
+        return text, 0
+
+    targets = dict(hits)
+    lines = text.split("\n")
+    for lineno, bracket in targets.items():
+        line = lines[lineno - 1]
+        lines[lineno - 1] = line.replace(bracket, f"\\{bracket}", 1)
+    return "\n".join(lines), len(targets)
 
 
 def strip_duplicated_numbers(text: str) -> tuple[str, int]:
@@ -1089,12 +1706,17 @@ def lint_kit(kit_dir: Path) -> LintReport:
         translation = strip_wrapping_fence(target_path.read_text(encoding="utf-8"))
         findings += lint_chunk_pair(source_path.stem, source, translation)
         translations.append(translation)
-        if source.strip():
-            ratios.append((source_path.stem, len(translation) / len(source)))
+        source_prose = _prose_length(source)
+        if source_prose:
+            ratios.append((source_path.stem, _prose_length(translation) / source_prose))
 
     findings += _check_expansion_outliers(ratios)
 
     map_path = kit_dir / "image_map.json"
+    try:
+        preamble: str | None = load_preamble()
+    except FileNotFoundError:
+        preamble = None
 
     if translations:
         combined = "\n\n".join(translations)
@@ -1110,7 +1732,7 @@ def lint_kit(kit_dir: Path) -> LintReport:
         # replies still carry IMG_nnnn tokens, so linting them as-is would
         # report every single token as a figure that does not resolve.
         findings += lint_latex(
-            _restore_for_lint(combined, map_path), base_dir=kit_dir
+            _restore_for_lint(combined, map_path), base_dir=kit_dir, preamble=preamble
         ).findings
 
     if map_path.exists():
@@ -1139,14 +1761,41 @@ def _restore_for_lint(text: str, map_path: Path) -> str:
     return restore_images(text, mapping)[0]
 
 
+# Everything that is carried over rather than translated: math on both sides,
+# plus HTML tables in the source and tabular/table environments in the
+# translation.
+_NON_PROSE_RE = re.compile(
+    r"\$\$.*?\$\$|\$[^$\n]+\$|\\\[.*?\\\]|<table\b.*?</table>"
+    r"|\\begin\{(equation|align|gather|multline|tabular|table|longtable)\*?\}"
+    r".*?\\end\{\1\*?\}",
+    re.DOTALL,
+)
+
+
+def _prose_length(text: str) -> int:
+    """Length of ``text`` without its math and tables.
+
+    Math and tables pass through translation at about their own length,
+    while prose grows roughly threefold (CJK to English). Measured on raw
+    length, a chunk that is mostly formulas and tables therefore looks
+    "short": a real book's chunk 018 -- 12% CJK, the rest math and tables --
+    sat at 0.35x the median raw expansion and was reported as truncated,
+    though it matched its source paragraph for paragraph. On prose alone it
+    sat at 0.99x, and every chunk of that book fell between 0.93x and 1.1x.
+    """
+    return len(_NON_PROSE_RE.sub("", text))
+
+
 def _check_expansion_outliers(ratios: list[tuple[str, float]]) -> list[Finding]:
-    """Flag chunks that expanded far less than the book's own median.
+    """Flag chunks whose prose expanded far less than the book's own median.
 
     Self-calibrating, so it works whatever the language pair is: if every
     other chunk grew 3x and this one grew 1.2x, this one lost content. This
     catches the truncations the absolute floor in ``lint_chunk_pair`` is too
     lenient to see -- a reply cut off halfway is still well above 40% of its
-    source's length when the source is CJK.
+    source's length when the source is CJK. The ratios are of prose length
+    (see `_prose_length`), so a math-heavy chunk is not mistaken for a cut-off
+    one.
     """
     if len(ratios) < _MIN_CHUNKS_FOR_MEDIAN:
         return []
@@ -1166,7 +1815,7 @@ def _check_expansion_outliers(ratios: list[tuple[str, float]]) -> list[Finding]:
         Finding(
             "truncated-chunk",
             Severity.REVIEW,
-            f"chunk {name} expanded {ratio:.2f}x against a book median of "
+            f"chunk {name}'s prose expanded {ratio:.2f}x against a book median of "
             f"{median:.2f}x -- far short of its neighbours, so it was probably cut off",
         )
         for name, ratio in ratios
@@ -1227,6 +1876,9 @@ __all__ = [
     "lint_kit",
     "lint_latex",
     "lint_markdown",
+    "promote_tagged_display",
+    "restore_display_delimiters",
     "strip_duplicated_numbers",
+    "strip_zero_width",
     "strip_wrapping_fence",
 ]

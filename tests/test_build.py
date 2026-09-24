@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from src.build import DEFAULT_ENGINE, build_pdf, log_excerpt
+from src.build import DEFAULT_ENGINE, build_pdf, log_excerpt, parse_log_errors
 
 
 class FakeRun:
@@ -171,6 +171,74 @@ def test_a_silent_failure_to_produce_a_pdf_is_caught(
 
     assert succeeded is False
     assert "no PDF was produced" in message
+
+
+ASSEMBLED = (
+    "\\documentclass{book}\n"  # 1
+    "\\begin{document}\n"  # 2
+    "% >>> translated/002.tex:3\n"  # 3 -- the fragment's body starts on its line 3
+    "\\section{One}\n"  # 4 -> translated/002.tex:3
+    "Text.\n"  # 5 -> translated/002.tex:4
+    "\\sectionsection{Two}\n"  # 6 -> translated/002.tex:5
+    "\\end{document}\n"
+)
+
+TWO_ERROR_LOG = (
+    "! Undefined control sequence.\n"
+    "<recently read> \\sectionsection\n"
+    "\n"
+    "l.6 \\sectionsection\n"
+    "                   {Two}\n"
+    "! Undefined control sequence.\n"  # the same error reported twice
+    "l.6 \\sectionsection\n"
+    "! LaTeX Error: Unicode character ① (U+2460)\n"
+    "l.1 \\documentclass{book}①\n"
+    "!  ==> Fatal error occurred, no output PDF file produced!\n"
+)
+
+
+def test_log_errors_are_mapped_back_to_the_fragment_they_came_from(tmp_path: Path) -> None:
+    tex_path = tmp_path / "translated_book.tex"
+    tex_path.write_text(ASSEMBLED, encoding="utf-8")
+
+    errors = parse_log_errors(TWO_ERROR_LOG, tex_path)
+
+    assert [(e.location, e.message) for e in errors] == [
+        ("translated/002.tex:5", "Undefined control sequence."),
+        ("translated_book.tex:1", "LaTeX Error: Unicode character ① (U+2460)"),
+    ]
+    assert errors[0].context == "\\sectionsection"
+
+
+def test_a_failed_build_lists_every_error_from_one_more_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """-halt-on-error stops at the first error: four defects cost four builds.
+    A failure triggers one run without it, and every error is reported."""
+    tex_path = tmp_path / "translated_book.tex"
+    tex_path.write_text(ASSEMBLED, encoding="utf-8")
+    runner = FakeRun(returncode=1)
+
+    def run(command, *, cwd, **kwargs):  # noqa: ANN001 - subprocess shim
+        for arg in command:
+            if arg.startswith("-output-directory="):
+                out_dir = Path(arg.split("=", 1)[1])
+                (out_dir / "translated_book.log").write_text(TWO_ERROR_LOG, encoding="utf-8")
+        return runner(command, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr("src.build.shutil.which", lambda engine: f"/usr/bin/{engine}")
+    monkeypatch.setattr("src.build.subprocess.run", run)
+
+    succeeded, message = build_pdf(tex_path)
+
+    assert succeeded is False
+    assert "translated/002.tex:5: Undefined control sequence." in message
+    assert "translated_book.tex:1: LaTeX Error: Unicode character" in message
+    assert "(2)" in message
+    probe = runner.calls[-1][0]
+    assert "-halt-on-error" not in probe
+    assert "-interaction=nonstopmode" in probe
+    assert runner.calls[-1][1] == tmp_path  # still finds images/ relative to the .tex
 
 
 def test_log_excerpt_falls_back_to_the_tail_when_nothing_matches(tmp_path: Path) -> None:

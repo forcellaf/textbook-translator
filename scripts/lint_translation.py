@@ -25,7 +25,7 @@ from pathlib import Path
 
 from _bootstrap import configure_logging  # noqa: E402  (must precede src imports)
 
-from src.kit import ASSEMBLED_NAME  # noqa: E402
+from src.kit import TRANSLATED_DIRNAME  # noqa: E402
 from src.lint import apply_auto_fixes, lint_kit, lint_latex, lint_markdown  # noqa: E402
 
 
@@ -43,8 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="apply the provably safe repairs in place (doubled commands and "
-        "duplicated section/caption numbers)",
+        help="apply the provably safe repairs in place (doubled commands, "
+        "duplicated section/caption numbers, ...). For a kit, the saved replies "
+        "in translated/ are repaired",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -71,11 +72,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {kit_dir} is not a directory", file=sys.stderr)
             return 1
         if args.fix:
-            assembled = kit_dir / ASSEMBLED_NAME
-            if assembled.exists():
-                _autofix(assembled, assembled.read_text(encoding="utf-8"))
-            else:
-                print(f"note: --fix needs {assembled}; run scripts/build_pdf.py first")
+            # Repair the saved replies themselves, not the assembled book: they
+            # are what lint_kit reads and what the next build is assembled from,
+            # so a fix applied only to translated_book.tex is overwritten by it.
+            for fragment in sorted((kit_dir / TRANSLATED_DIRNAME).glob("*.tex")):
+                _autofix(fragment, fragment.read_text(encoding="utf-8"))
         report = lint_kit(kit_dir)
         print(f"linting {kit_dir}")
 
@@ -89,7 +90,9 @@ def main(argv: list[str] | None = None) -> int:
 def _autofix(path: Path, text: str) -> str:
     fixed, count = apply_auto_fixes(text)
     if count:
-        path.write_text(fixed, encoding="utf-8")
+        # newline="\n": on Windows the default rewrites every line ending as
+        # CRLF, turning a three-line repair into a whole-file diff.
+        path.write_text(fixed, encoding="utf-8", newline="\n")
         print(f"auto-fixed {count} finding(s) in {path}")
     return fixed
 
