@@ -9,9 +9,13 @@ Stages, in order -- the order matters:
   1. normalize   merge split headings; report anything else short
   2. profile     one cached LLM call: glossary + a level per heading
   3. re-level    apply that classification (pure, no LLM)
-  4. tables      HTML -> pipe tables; warn and skip degenerate ones
-  5. tokenize    image paths -> IMG_nnnn
-  6. chunk       ~30,000 chars on paragraph boundaries
+  4. structure   parts / chapters / readings: DeepSeek labels the whole outline
+                 from the numbering under each heading, code cross-checks it
+                 and follows up on conflicts. Headings become final \\part /
+                 \\chapter / \\chapter* commands, so the translator never guesses
+  5. tables      HTML -> pipe tables; warn and skip degenerate ones
+  6. tokenize    image paths -> IMG_nnnn
+  7. chunk       ~30,000 chars on paragraph boundaries
 
 Normalizing before profiling is not optional: headings are matched by their
 exact text, so classifying ``## 第13章`` and then merging it into
@@ -30,8 +34,15 @@ from _bootstrap import configure_logging  # noqa: E402  (must precede src import
 
 from src.config import KIT_CHUNK_CHARS  # noqa: E402
 from src.kit import build_kit  # noqa: E402
+from src.latex import load_preamble, preamble_first_chapter  # noqa: E402
 from src.normalize import normalize  # noqa: E402
 from src.profiler import apply_heading_levels, profile_book  # noqa: E402
+from src.structure import (  # noqa: E402
+    STRUCTURE_FILENAME,
+    analyze_structure,
+    apply_structure,
+    render_outline,
+)
 from src.tables import convert_html_tables  # noqa: E402
 
 NORMALIZED_NAME = "normalized.md"
@@ -56,6 +67,12 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the LLM call; headings keep the levels the parser gave them",
     )
     parser.add_argument("--force-profile", action="store_true", help="ignore the cached profile")
+    parser.add_argument(
+        "--force-structure",
+        action="store_true",
+        help="ask DeepSeek again about headings it already decided (manual "
+        "entries in structure.json are always kept)",
+    )
     parser.add_argument(
         "--fix-math-spacing",
         action="store_true",
@@ -112,7 +129,39 @@ def main(argv: list[str] | None = None) -> int:
             f"{counts['unchanged']} unchanged, {counts['demoted']} demoted to body text"
         )
 
-    # ── 4. tables ────────────────────────────────────────────────────────
+    # ── 4. structure ─────────────────────────────────────────────────────
+    llm = None
+    if not args.no_profile:
+        from src.llm.factory import get_llm
+
+        try:
+            llm = get_llm()
+        except Exception as exc:  # noqa: BLE001 - rules alone still decide most headings
+            print(f"\nstructure: no LLM available ({exc}); using the numbering rules only")
+    report = analyze_structure(
+        text,
+        llm=llm,
+        cache_path=work_dir / STRUCTURE_FILENAME,
+        force=args.force_structure,
+        first_chapter=preamble_first_chapter(load_preamble()),
+    )
+    kinds = report.counts()
+    print(
+        f"\nstructure: {kinds['part']} part(s), {kinds['chapter']} chapter(s), "
+        f"{kinds['reading']} reading(s), {kinds['other']} front/back matter, "
+        f"{kinds['undecided']} undecided; {report.llm_calls} DeepSeek call(s)"
+    )
+    print(render_outline(report))
+    for warning in report.warnings:
+        print(f"  WARNING: {warning}")
+    text, rewritten = apply_structure(text, report)
+    print(
+        f"  rewrote: {rewritten['summary item']} summary item(s) back to paragraphs, "
+        f"{rewritten['unnumbered section']} section(s) of unnumbered chapters as \\section*"
+    )
+    print(f"  check the outline above; correct it in {work_dir / STRUCTURE_FILENAME}")
+
+    # ── 5. tables ────────────────────────────────────────────────────────
     text, reports = convert_html_tables(text)
     converted = sum(1 for r in reports if r.converted)
     print(f"\ntables: {converted} of {len(reports)} converted to pipe tables")
@@ -122,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
 
     (work_dir / PREPARED_NAME).write_text(text, encoding="utf-8")
 
-    # ── 5-6. tokenize + chunk ────────────────────────────────────────────
+    # ── 6-7. tokenize + chunk ────────────────────────────────────────────
     kit_dir = args.kit_dir or (work_dir / "kit")
     kit = build_kit(
         text,

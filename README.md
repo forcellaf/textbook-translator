@@ -63,8 +63,9 @@ data/work/<book_name>/
 ├── images/             every figure, flat, named by content hash
 ├── merged.md           raw parser output          ← stage 1
 ├── normalized.md       after split-heading repair ← stage 2
-├── prepared.md         after re-levelling + tables
+├── prepared.md         after re-levelling, structure + tables
 ├── book_profile.json   cached LLM call: glossary + heading levels
+├── structure.json      part / chapter / reading per top-level heading (hand-editable)
 └── kit/
     ├── chunks/001.md…       source chunks, image paths tokenised
     ├── translated/001.tex…  your saved replies (you fill this in)
@@ -120,19 +121,23 @@ complete one.
 uv run python scripts/prepare_kit.py data/work/physics
 ```
 
-Six steps, in this order:
+Seven steps, in this order:
 
 1. **normalize** — merge split headings; report anything else short
 2. **profile** — one cached LLM call: glossary + a level per heading
 3. **re-level** — apply that classification (pure, no LLM)
-4. **tables** — HTML → markdown pipe tables
-5. **tokenize** — image paths → `IMG_nnnn`
-6. **chunk** — ~30,000 chars, on paragraph boundaries only
+4. **structure** — decide which top-level headings are parts, chapters and
+   supplementary readings, and write them as final `\part` / `\chapter` /
+   `\chapter*` (see below)
+5. **tables** — HTML → markdown pipe tables
+6. **tokenize** — image paths → `IMG_nnnn`
+7. **chunk** — ~30,000 chars, on paragraph boundaries only
 
 | Flag | Purpose |
 |---|---|
-| `--no-profile` | Skip the LLM call; headings keep their parsed levels |
+| `--no-profile` | Skip the LLM calls; headings keep their parsed levels, and structure uses the numbering rules only |
 | `--force-profile` | Ignore the cached profile |
+| `--force-structure` | Ask DeepSeek again about headings it already decided |
 | `--chunk-chars N` | Override the chunk budget |
 | `--fix-math-spacing` | Trim whitespace inside inline `$` (see below) |
 | `-v` | Also list every short heading left unchanged |
@@ -143,7 +148,8 @@ Six steps, in this order:
   chapter merges (`第13章` + `电势` → `第13章 电势`) and 3 part-title merges.
 - **`part-ordinal-missing`** means a part title was recovered but its number
   was not in the parsed text at all (`第篇 电磁学`). The pipeline will not
-  invent it — insert the digit by hand in `normalized.md` and re-run.
+  invent it, but it no longer needs to: the structure step recognises `第篇`
+  as a part and LaTeX numbers parts itself.
 - **Tables left as HTML** are reported with a reason. Merged cells (`colspan`/
   `rowspan`) cannot be expressed as a pipe table without duplicating content,
   so they stay as HTML rather than being guessed at. On the reference book,
@@ -154,9 +160,42 @@ Six steps, in this order:
 classifier puts one heading at the wrong level, fix that line and re-run —
 the cached profile is reused, so no LLM call is repeated.
 
+**Structure.** The parser drops `第N章` from most chapter titles, so a chapter
+(`静电场`) and a supplementary reading (`大气电学`) look alike by title. What
+tells them apart is the numbering under them compared with their siblings: on
+the reference book, the chapters' sections and captions carry the chapter
+number (`12.1`, `图12.3`) and the readings' are lettered (`G.1`, `图G.3`).
+Every book has its own conventions, so no fixed rule decides:
+
+- Code collects the evidence per top-level heading — sub-heading, caption and
+  equation-tag numbers — without assuming any caption word or title format.
+- **One DeepSeek call labels the whole outline** (part / chapter / reading /
+  front-back matter), so it can compare siblings.
+- Code cross-checks the labels: chapter numbers must run on, a chapter's
+  number must match the numbering under it, a part must have chapters after
+  it, and this corpus's numbering conventions give a second opinion (an
+  opinion the sequence rules out — OCR reading `I.1` as `1.1` — is ignored).
+  A conflicting row gets one follow-up call, and its new answer is kept only
+  if it resolves the conflict without creating another.
+- Whatever still conflicts is marked `<-- CHECK` in the printed outline.
+
+On the reference book this is one call and all 30 headings are right. Read
+the outline anyway — it takes ten seconds. To correct a heading, set its
+`"kind"` (and `"number"`) in `structure.json` and its `"by"` to `"manual"`,
+then re-run. Without an LLM (`--no-profile`) the numbering rules decide on
+their own, and the outline says so.
+
+The step also turns numbered items under a chapter summary (提要), which the
+parser made into headings, back into paragraphs, and stars the sections of a
+reading — a numbered `\section` inside `\chapter*` would be numbered from the
+chapter before it. It warns if the book's first chapter does not match
+`\setcounter{chapter}` in `assets/preamble.tex`.
+
 **Then translate.** Paste `kit/system_prompt.txt` as the system instruction,
 send `kit/chunks/001.md` … one at a time in a fresh conversation each, and save
-each reply as `kit/translated/<same-number>.tex`.
+each reply as `kit/translated/<same-number>.tex`. Copy the reply **as
+Markdown**, not the rendered text: the rendered copy silently drops every `$`
+and every `\[`, and the whole book's mathematics ends up as plain text.
 
 `system_prompt.txt` is [assets/system_prompt_latex.txt](assets/system_prompt_latex.txt)
 with the book's context and glossary substituted into it. That file is meant to
@@ -189,17 +228,24 @@ at once here, with line numbers and context.
 Findings are split three ways:
 
 - **review** — a human must look. Exits non-zero, which gates the build.
-- **auto-fix** — provably safe. Apply with `--fix`.
+- **auto-fix** — provably safe. Apply with `--fix`, which repairs the saved
+  replies in `kit/translated/` in place.
 - **info** — context, not a problem.
 
 Per chunk pair: CJK residue, truncation (both an absolute floor and an outlier
-against the book's own median expansion), and image-token integrity — every
-`IMG_nnnn` present, none invented.
+against the book's own median expansion of *prose* — math and tables are left
+out, so a chunk that is mostly formulas is not mistaken for a cut-off one), and
+image-token integrity — every `IMG_nnnn` present, none invented.
 
 On the translated LaTeX: unbalanced and crossed environments, undefined
-environments, preamble leakage, brace balance, inline `$` parity per paragraph,
-duplicated numbering, dangling argument commands (`\mathrm$`), unknown command
-tokens, and figure paths that do not resolve on disk.
+environments, preamble leakage, characters pdflatex cannot typeset, display
+delimiters that lost their backslash, `\tag` outside an equation, brace
+balance, inline `$` parity per paragraph, duplicated numbering, Markdown
+headings left in the output, dangling argument commands (`\mathrm$`), doubled
+commands, unknown command tokens, text-mode commands inside math
+(`^{\textcircled{1}}`), commands whose package the preamble does not load
+(`\multirow`), chapter numbers that drift from the book's own equation tags,
+and figure paths that do not resolve on disk.
 
 **Every one of those LaTeX checks was a real failure during testing, and none
 of them is visible by reading the file** — the output looks correct and only
@@ -214,11 +260,18 @@ Three behaviours are deliberate:
   known-commands list and 1 was the genuine defect. A checker with that hit
   rate must not edit. If a flagged command is real, add it to `KNOWN_COMMANDS`
   in [src/lint.py](src/lint.py).
-- **A doubled known command is auto-fixed** (`\mathrmmathrm` → `\mathrm`): it
-  cannot be anything but damage.
+- **A doubled known command is auto-fixed** (`\mathrmmathrm` → `\mathrm`,
+  `\section\section` → `\section`): it cannot be anything but damage. The
+  second spelling is only repaired for commands that are never repeated on
+  purpose — `\prime\prime` and `\bar\bar{x}` are real LaTeX.
 - **So is a duplicated number** (`\section{12.1 Electric Charge}` →
   `\section{Electric Charge}`): the pattern is unambiguous, and a title that
   merely starts with a digit (`3D Charge Distributions`) is left alone.
+- **So is a bare `[` on its own line** (→ `\[`). On the first real book, 971
+  display blocks opened correctly and 94 had the backslash dropped, which
+  typesets a literal bracket and runs the mathematics after it in text mode.
+  Repaired only when the brackets strictly alternate, so every opener has its
+  own closer; otherwise they are reported.
 
 Lint one file instead of a kit with `--tex one_chunk.tex` (a translated
 fragment) or `--markdown merged.md` (the parsed source).
@@ -242,6 +295,13 @@ second pass is what fills in the table of contents.
 
 The lint gate is on by default. A broken figure or an untranslated chunk is far
 cheaper to fix now than to find in a 700-page PDF.
+
+The build stops at the first LaTeX error (`-halt-on-error`), so when it fails
+it compiles once more without that flag and lists **every** error in the book,
+each located in the reply it came from — `translated/008.tex:39`, not line
+6,532 of the assembled file. Assembly leaves a `% >>> translated/NNN.tex:L`
+comment above each reply for exactly this. Only an error TeX cannot recover
+from (e.g. "TeX capacity exceeded") ends the list early.
 
 `pdflatex` is enough: the preamble uses `inputenc`, and a finished book has no
 Chinese left in it. If one does, `assets/preamble.tex` carries a commented
@@ -309,6 +369,7 @@ What genuinely still needs handling, and which stage handles it:
 | Issue | Stage |
 |---|---|
 | Headings flat below level 2 (422 of 442 at `##`) | prepare → profile + re-level |
+| Parts and readings mistaken for chapters, shifting every chapter number | prepare → structure |
 | Split headings (`## 第13章` / `## 电势`) | prepare → normalize |
 | Tables emitted as raw HTML, which the model reproduces as HTML | prepare → tables |
 | Model corrupting 64-char image hashes (~7.7%) | prepare → tokenize |
@@ -369,6 +430,7 @@ nothing repairs them any more.
 | [src/tables.py](src/tables.py) | HTML tables → pipe tables |
 | [src/latex.py](src/latex.py) | Preamble + prompt assets, fragment scanning, assembly |
 | [src/profiler.py](src/profiler.py) | Cached per-book LLM call: glossary + heading levels |
+| [src/structure.py](src/structure.py) | Parts / chapters / readings from the numbering; DeepSeek for the rest |
 | [src/kit.py](src/kit.py) | Tokenising, chunking, assembly, packaging |
 | [src/lint.py](src/lint.py) | Every check, in one pass |
 | [src/build.py](src/build.py) | `pdflatex` invocation |

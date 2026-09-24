@@ -412,7 +412,7 @@ def classify_headings(
         raw = llm.generate(
             _build_heading_prompt(source_lang), "\n".join(headings), temperature=0.0
         )
-        parsed = _extract_json_object(raw)
+        parsed = extract_json_object(raw)
     except Exception as exc:  # noqa: BLE001 - classification must never be fatal
         logger.warning(
             "Heading classification failed (%s); leaving heading levels as the "
@@ -493,7 +493,7 @@ def apply_heading_levels(text: str, profile: BookProfile) -> tuple[str, Counter[
 # ── Response parsing ────────────────────────────────────────────────────────
 
 
-def _extract_json_object(raw: str) -> dict:
+def extract_json_object(raw: str) -> dict:
     """Pull a JSON object out of a model response.
 
     Models wrap JSON in ``` fences, prefix it with "Here is the profile:", or
@@ -583,7 +583,7 @@ def profile_book(
             _sample_text(text),
             temperature=0.2,
         )
-        profile = BookProfile.from_dict(_extract_json_object(raw))
+        profile = BookProfile.from_dict(extract_json_object(raw))
         if with_headings:
             # Isolated from the profile call above: `classify_headings` never
             # raises, so a heading failure costs the heading levels only, not
@@ -622,6 +622,7 @@ __all__ = [
     "apply_heading_levels",
     "classify_headings",
     "extract_headings",
+    "extract_json_object",
     "profile_book",
     "profile_to_prompt_block",
 ]

@@ -19,18 +19,38 @@ perfect LaTeX document that still contains Chinese is a FAILED answer.
 
 ## Structure
 
-- Chapter headings   -> \chapter{...}
-- Numbered sections (12.1 ...)    -> \section{...}
-- Numbered subsections (1. ...)   -> \subsection{...}
-- Worked examples (例12.3)        -> \begin{example} ... \end{example}
-- Exercises / problems (习题 N.N) -> \begin{exercise} ... \end{exercise}
-- Chapter summaries (提要)        -> \section*{Summary}
+Parts, chapters and supplementary readings have ALREADY been decided, and arrive in
+the source as LaTeX: \part{...}, \chapter{...}, \chapter*{...}, and inside readings
+\section*{...} and \subsection*{...}. For each of these lines:
+
+- Keep the command exactly as written -- same command, same star or no star.
+- Translate only the title inside the braces.
+- Never change one command into another, never add or remove a star, never add a number.
+
+| source | CORRECT |
+|---|---|
+| `\part{光学}` | `\part{Optics}` |
+| `\chapter{静电场}` | `\chapter{Electrostatic Field}` |
+| `\chapter*{大气电学}` | `\chapter*{Atmospheric Electricity}` |
+| `\section*{闪电}` | `\section*{Lightning}` |
+
+The remaining headings are still Markdown. Convert them like this:
+
+- Numbered sections (`## 12.1 ...`)       -> \section{...}
+- Numbered subsections (`### 1. ...`)     -> \subsection{...}
+- Worked examples (例12.3)                -> \begin{example} ... \end{example}
+- Exercises / problems (习题 N.N)         -> \begin{exercise} ... \end{exercise}
+- Chapter summaries (提要)                -> \section*{Summary}
+
+A numbered line that is NOT a Markdown heading -- "1. 库仑定律……", "2. 电介质的极化……", as in
+a chapter summary -- is a paragraph of a list. Keep it a plain numbered paragraph.
+Never promote it to \subsection or \subsection*.
 
 ## NUMBERING -- READ THIS CAREFULLY
 
 LaTeX generates the numbers for chapters, sections, subsections, figures, tables,
-examples and exercises automatically. The preamble is already configured so that this
-volume starts at chapter 12, so section 1 of chapter 12 comes out as "12.1" on its own.
+examples and exercises automatically. The preamble is already configured with this
+volume's first chapter number, so section 1 of chapter 12 comes out as "12.1" on its own.
 
 **Strip the number from the source text in every one of these cases.** Writing it
 yourself produces a doubled number such as "12.1 12.1 Electric Charge" or
@@ -38,8 +58,8 @@ yourself produces a doubled number such as "12.1 12.1 Electric Charge" or
 
 | source | WRONG | CORRECT |
 |---|---|---|
-| `12.1 电荷` | `\section{12.1 Electric Charge}` | `\section{Electric Charge}` |
-| `1. 电荷的种类` | `\subsection{1. Types of Charge}` | `\subsection{Types of Charge}` |
+| `## 12.1 电荷` | `\section{12.1 Electric Charge}` | `\section{Electric Charge}` |
+| `### 1. 电荷的种类` | `\subsection{1. Types of Charge}` | `\subsection{Types of Charge}` |
 | `例12.3` | `\begin{example} Example 12.3 ...` | `\begin{example} ...` |
 | `习题 12.1` | `\begin{exercise} 12.1 ...` | `\begin{exercise} ...` |
 | `图 12.3 电场分布` | `\caption{Figure 12.3 Field distribution}` | `\caption{Field distribution}` |
@@ -67,9 +87,54 @@ inside the same example environment as a new paragraph beginning \textbf{Solutio
 - Inline math stays inline: $...$. Display math becomes \begin{equation}...\end{equation}
   when the source numbers it, or \[...\] when it does not.
 - Keep any \tag{12.1} exactly as given — that is the book's own equation number.
+  A \tag is only allowed inside \begin{equation}...\end{equation}: a display that
+  carries a \tag must be an equation, never $$...$$ or \[...\].
 - Every symbol that was inside math must stay inside math. Never let a formula become
   body text.
 - Escape & % # _ and a literal $ when they are prose rather than markup.
+- Never put Chinese inside \text{...} in a formula -- translate it:
+  `(\text{在环管内})` becomes `(\text{inside the toroid})`.
+- Text-mode commands do not work inside math. A circled label in a formula is
+  `\text{\textcircled{1}}`, never a bare `\textcircled{1}`.
+- There is no \omicron command; the Greek letter omicron is a plain `o`.
+
+## Characters -- the output is compiled with pdflatex
+
+pdflatex stops on every character outside basic Latin and Latin-1 (é, ü, à are fine).
+Never copy a symbol from the source as a Unicode character. Write the LaTeX for it:
+
+| in the source | write |
+|---|---|
+| μ in prose (50 μs, 25 μm) | `50~$\mu$s`, `25~$\mu$m` |
+| any Greek letter in prose (α, θ, λ, ε) | `$\alpha$`, `$\theta$`, `$\lambda$`, `$\varepsilon$` |
+| primes ′ ″ (point O′) | `O$'$`, `O$''$` |
+| subscript/superscript digits in prose (LiNbO₃) | `LiNbO\textsubscript{3}` |
+| × · − ± ≈ ≤ ≥ ∞ → in prose | `$\times$ $\cdot$ $-$ $\pm$ $\approx$ $\leq$ $\geq$ $\infty$ $\rightarrow$` |
+| a range with ～ or ~ (3～4 nm) | `3--4~nm` |
+| Roman numerals Ⅰ Ⅱ Ⅲ | `I II III` (in a formula: `E_{\mathrm{III}}`) |
+| ° and ℃ | `$^\circ$`, `$^\circ$C` |
+| circled numbers ①②③ that label something in the text ("regions ①, ② and ③") | `\textcircled{\scriptsize 1}` |
+
+Circled numbers after a word or formula (`……极化①`, `$^{①}$`, `^{\textcircled{1}}`) are
+footnote markers. If the footnote's own text is in the chunk (a line starting with ①),
+put it at the marker as `\footnote{translated footnote text}` and drop the separate
+line. If it is not in the chunk, delete the marker -- the footnote was lost before
+translation and the marker would point at nothing.
+
+Chinese characters are always translated. The only exception is a character discussed
+as a character ("the character 电 first appeared on bronzes"): write its pinyin in
+italics instead -- `the character \emph{diàn}`.
+
+## Commands and Markdown
+
+- Write every command exactly once. `\section{...}`, never `\sectionsection{...}` or
+  `\section\section{...}`; `\mathrm{mm}`, never `\mathrmmathrm{mm}` or
+  `\mathrm\mathrm{mm}`. Re-read each heading line before you finish.
+- Never output Markdown. No `#` headings (a `#` at the start of a line stops the
+  build), no `**bold**`, no `-` or `*` bullet lists, no backticks. Use \textbf{...},
+  itemize and enumerate.
+- Use only commands that plain LaTeX, amsmath/amssymb, booktabs, multirow or the
+  preamble's \bookfig/\bookfigtwo provide. No \SI, \ce, \cancel, \bm, \degree.
 
 ## Figures — this is the part most likely to go wrong
 
