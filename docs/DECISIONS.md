@@ -157,3 +157,57 @@ honoured by `--force-profile`). Decided rows are no longer flagged or counted
 as "flagged" figures. "Manual beats agent": both are immune to the pipeline;
 between the two, the skill forbids the agent from editing a `manual` entry,
 and `provenance.stronger()` ranks them wherever two could compete.
+
+## Phase 4 — run state, `--json`, resumable parse, page range, publish
+
+**Exit code 4 means "a remote job is still running; re-run to keep polling"**,
+for both `parse_book.py` and `translate_kit.py`. Re-running resumes the
+recorded batch (`parse_batch.json`, `kit/translate_batch.json`) and never
+re-submits. Uploading/submitting again takes `--force`.
+
+**The parse batch id is recorded after the upload completes.** A crash in the
+middle of an upload is the one case a resume cannot recover without
+re-uploading (a part may or may not have been submitted); recording before
+the upload would instead resume a batch whose files may never arrive. The
+upload is minutes; the poll is hours.
+
+**`--wait-minutes` bounds one run's polling** (default: the old 120-minute
+timeout for humans; the skill passes 9 so a call fits in a Bash call).
+
+**An existing `merged.md` newer than the PDF is never re-parsed**, even when a
+`page_range.json` appears later. The summary (`--json`) reports `trimmed:
+false` for such a book so the run log can say it was parsed untrimmed.
+
+**Trim offset** is written to `parts/manifest.json` (`page_offset`,
+`trimmed`, `original_pdf`); `src.page_range.original_page(n, offset)` maps
+back. `source_body.pdf` is only re-cut when the PDF or `page_range.json` is
+newer than it, so its mtime (which decides re-parsing) is stable.
+
+**First-heading cross-check** judges "chapter" without a title format: a
+第N章 title or numbered sections under it (the structure module's rules),
+and flags known front-matter titles (目录, 前言, Contents, ...) explicitly.
+
+**`page_range.json`'s `first_chapter_number` is compared with the preamble in
+stage 2** and printed as a warning with the exact `\setcounter` to use.
+
+**`--json` everywhere prints JSON only on stdout**; the human report goes to a
+log file whose path is in the JSON (`<kit>/logs/lint.txt`,
+`<kit>/logs/build.txt`, `<work>/logs/prepare_kit.txt`), and logging stays on
+stderr.
+
+**`build_pdf.py` records every attempt in `kit/build_result.json`** (gated by
+lint, failed in assembly or compile, or built). Publishing trusts it only
+together with the files: the PDF must exist and be newer than the `.tex`.
+
+**Publishing a failed build renames an earlier run's published PDF/TeX to
+`*.stale.*`** instead of leaving it beside a log that says the build failed.
+Nothing is deleted.
+
+**`translate_kit.py` (API mode) writes failed replies to `NNN.failed.tex`**,
+never `NNN.tex`, so lint keeps reporting the chunk as missing and the
+orchestrator retries it.
+
+**`run_state.py` CLI shape:** `show`, `set stage|mode|backend|chunk`,
+`sync-chunks`, `build ok|failed`, `decide`. Writes are atomic (temp file +
+replace). A chunk's `attempts` counts translation outcomes
+(`translated`/`failed`), not `pending` resets.

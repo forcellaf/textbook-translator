@@ -19,6 +19,7 @@ from src import config
 from src.mineru_api import (
     MinerUClient,
     MinerUError,
+    batch_in_flight,
     parse_pdf,
 )
 
@@ -431,3 +432,47 @@ def test_missing_pdf_raises_file_not_found(tmp_path: Path) -> None:
     with MinerUClient(token="tok", transport=api.transport()) as client:
         with pytest.raises(FileNotFoundError):
             parse_pdf(tmp_path / "nope.pdf", tmp_path / "work", client=client)
+
+
+# ── Resuming a batch instead of uploading again ─────────────────────────────
+
+
+def test_a_rerun_resumes_the_batch_in_flight_without_uploading(tmp_path: Path) -> None:
+    """A whole book polls for up to two hours, longer than one shell call.
+    The batch id is saved after the upload; a re-run polls the same batch
+    and never spends quota twice."""
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 5)
+    work_dir = tmp_path / "work"
+    api = FakeAPI(markdown={"book_part_001": "# Book"}, poll_states=[["running"], ["done"]])
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(TimeoutError, match="re-run"):
+            parse_pdf(pdf, work_dir, client=client, wait_minutes=0)
+    record = json.loads((work_dir / "parse_batch.json").read_text(encoding="utf-8"))
+    assert record["batch_id"] == BATCH_ID and record["state"] == "submitted"
+    assert batch_in_flight(work_dir) == BATCH_ID
+
+    submits = sum(1 for r in api.requests if r.method == "POST")
+    uploads = len(api.uploaded)
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        result = parse_pdf(pdf, work_dir, client=client)
+
+    assert sum(1 for r in api.requests if r.method == "POST") == submits  # no new batch
+    assert len(api.uploaded) == uploads  # nothing uploaded again
+    assert "Book" in result.merged_path.read_text(encoding="utf-8")
+    assert json.loads((work_dir / "parse_batch.json").read_text(encoding="utf-8"))["state"] == "merged"
+    assert batch_in_flight(work_dir) is None
+
+
+def test_force_uploads_again_even_with_a_batch_in_flight(tmp_path: Path) -> None:
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 5)
+    work_dir = tmp_path / "work"
+    api = FakeAPI(markdown={"book_part_001": "# Book"}, poll_states=[["running"], ["done"]])
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        with pytest.raises(TimeoutError):
+            parse_pdf(pdf, work_dir, client=client, wait_minutes=0)
+        parse_pdf(pdf, work_dir, client=client, force=True)
+
+    assert sum(1 for r in api.requests if r.method == "POST") == 2

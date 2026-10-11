@@ -41,6 +41,16 @@ catch. ``pipeline`` remains selectable per book for that reason.
 
 Quota is 1000 pages/day at top priority, so the page count is logged before
 anything is uploaded.
+
+Resuming instead of re-uploading
+--------------------------------
+A whole book can take up to two hours to parse, longer than one shell call
+may run. So the batch id is written to ``<work-dir>/parse_batch.json`` the
+moment the upload finishes, and a re-run with no ``merged.md`` yet resumes
+polling that batch: it never uploads again and never spends quota twice.
+``wait_minutes`` bounds one run's polling; past it the run raises
+``TimeoutError`` and the next run picks up the same batch. Uploading again
+takes ``force=True``.
 """
 
 from __future__ import annotations
@@ -68,6 +78,8 @@ PARTS_DIRNAME = "parts"
 # are sized from it (src.figures), so it is kept per part and merged per book.
 CONTENT_LIST_NAME = "content_list.json"
 PART_CONTENT_LIST_SUFFIX = "_content_list.json"
+# The in-flight batch: written after upload, read by a resuming run.
+PARSE_BATCH_NAME = "parse_batch.json"
 
 # Hard API limits. `config.SPLIT_MAX_PAGES` / `SPLIT_MAX_SIZE_MB` are the
 # (lower) targets we actually split to; these are the ceilings the service
@@ -322,8 +334,7 @@ class MinerUClient:
                 raise TimeoutError(
                     f"MinerU batch {batch_id} did not finish within {limit} minutes "
                     f"({_progress_line(results)}). The batch keeps running server-side; "
-                    f"re-run with MINERU_TIMEOUT_MINUTES raised, or check "
-                    f"{self.base_url}/extract-results/batch/{batch_id}"
+                    "re-run the same command to resume polling it (no re-upload)."
                 )
 
             time.sleep(interval)
@@ -488,6 +499,25 @@ def merge_content_lists(parts: list[tuple[Path, int]], out_path: Path) -> int:
     return len(merged)
 
 
+def _load_record(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) and data.get("batch_id") else None
+
+
+def _write_record(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def batch_in_flight(work_dir: Path) -> str | None:
+    """The id of a submitted, unmerged batch for this book, if any."""
+    record = _load_record(work_dir / PARSE_BATCH_NAME)
+    return str(record["batch_id"]) if record and record.get("state") == "submitted" else None
+
+
 def _page_count(pdf_path: Path) -> int:
     import pymupdf
 
@@ -507,6 +537,7 @@ def parse_pdf(
     model_version: str | None = None,
     language: str | None = None,
     force: bool = False,
+    wait_minutes: float | None = None,
 ) -> ParseResult:
     """Parse ``pdf_path`` with the MinerU cloud API into ``work_dir``.
 
@@ -522,7 +553,11 @@ def parse_pdf(
         token: Overrides ``MINERU_TOKEN``.
         model_version: ``"vlm"`` (default) or ``"pipeline"``.
         language: MinerU OCR language hint, default ``"ch"``.
-        force: Re-parse even when ``merged.md`` is already up to date.
+        force: Re-parse even when ``merged.md`` is already up to date, and
+            upload again even when a batch is already in flight. Spends quota.
+        wait_minutes: Poll for at most this long in this run (default:
+            ``MINERU_TIMEOUT_MINUTES``). A batch still running then raises
+            ``TimeoutError``; re-running resumes it without re-uploading.
 
     Returns:
         A ``ParseResult``. Parts that failed server-side are reported in
@@ -572,13 +607,46 @@ def parse_pdf(
     parts = [chunk.output_path for chunk in split.chunks]
     logger.info("Submitting %d part(s) to MinerU", len(parts))
 
+    record_path = work_dir / PARSE_BATCH_NAME
+    record = _load_record(record_path)
+    part_names = [p.name for p in parts]
+    if force and record:
+        logger.warning("--force: abandoning batch %s and uploading again", record.get("batch_id"))
+        record = None
+    if record and record.get("state") == "submitted" and record.get("parts") != part_names:
+        raise MinerUError(
+            f"Batch {record.get('batch_id')} is still in flight for different parts "
+            f"({record.get('parts')}); wait for it to finish, or pass --force to upload "
+            "again (spends quota)."
+        )
+
     owned = client is None
     client = client or MinerUClient(
         token=token, model_version=model_version, language=language
     )
     try:
-        batch_id = client.submit(parts)
-        results = client.poll(batch_id)
+        if record and record.get("state") == "submitted":
+            batch_id = str(record["batch_id"])
+            logger.info("Resuming batch %s (no upload, no quota spent)", batch_id)
+        else:
+            batch_id = client.submit(parts)
+            _write_record(
+                record_path,
+                {
+                    "batch_id": batch_id,
+                    "state": "submitted",
+                    "pdf": str(pdf_path),
+                    "parts": part_names,
+                    "pages": total_pages,
+                    "model_version": client.model_version,
+                    "language": client.language,
+                    "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            )
+        results = client.poll(
+            batch_id,
+            timeout_minutes=wait_minutes,
+        )
 
         by_name = {entry.get("file_name"): entry for entry in results}
         sections: list[str] = []
@@ -627,6 +695,14 @@ def parse_pdf(
         count = merge_content_lists(content_lists, work_dir / CONTENT_LIST_NAME)
         logger.info("Wrote %s (%d layout entries)", work_dir / CONTENT_LIST_NAME, count)
 
+    record = _load_record(record_path) or {}
+    record.update(
+        state="merged",
+        merged_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        failed_parts=[p.file_name for p in part_results if not p.ok],
+    )
+    _write_record(record_path, record)
+
     text_len = len(merged_path.read_text(encoding="utf-8"))
     n_images = sum(1 for _ in images_dir.iterdir()) if images_dir.exists() else 0
     logger.info("Wrote %s (%d chars) and %d image(s)", merged_path, text_len, n_images)
@@ -656,7 +732,9 @@ __all__ = [
     "MERGED_NAME",
     "MinerUClient",
     "MinerUError",
+    "PARSE_BATCH_NAME",
     "ParseResult",
+    "batch_in_flight",
     "PartResult",
     "merge_content_lists",
     "parse_pdf",
