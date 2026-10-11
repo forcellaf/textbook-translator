@@ -258,3 +258,26 @@ shared overlay, which both launchers use.
 
 **`.claude/settings.local.json` and `.claude/worktrees/` are gitignored**; the
 shared settings, skill and agents are tracked.
+
+## End-to-end check (no quota)
+
+Run on 2026-10-11 against a scratch copy of `eee_1` (`data/work/eee_1_e2e`,
+`merged.md` cut to chapter 1 = 2 chunks), stage 2 onwards, exchange backend,
+MinerU never called (`parse_book.py` denied in that run's settings overlay).
+Stage 2 asked 3 exchange requests (1 structure, 2 classify), answered by
+Sonnet/Haiku agents from the agent files' instructions; 2 chunks were
+translated by Haiku chunk translators at medium effort; lint found 0 review
+findings (fidelity included); the build succeeded on the first attempt and
+`data/output/eee_1_e2e/` received the PDF (47 pages), the `.tex` and
+`run_log.md`.
+
+**A single `Write` of a full-size chunk translation works** (chunk 001: ~29k
+source characters -> 75 KB of LaTeX in one Write), so the chunk-translator
+keeps the brief's one-Write instruction; no sectioned writing is needed.
+
+**Not exercised:** the headless launcher itself (`translate_unattended.sh`) —
+the standalone `claude` CLI on this machine was not logged in (`claude auth
+status`: loggedIn false) and reported `claude-opus-5-5` as unrecognised
+(v2.1.251). The orchestration was performed in an interactive session
+following SKILL.md instead, with generic subagents given the agent files'
+text, because that session predated `.claude/agents/`.
