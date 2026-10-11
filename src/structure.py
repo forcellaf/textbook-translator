@@ -62,6 +62,7 @@ from pathlib import Path
 
 from src.config import SOURCE_LANG
 from src.llm.base import BaseLLM
+from src.llm.exchange import ExchangePending
 from src.profiler import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,9 @@ class StructureReport:
     divisions: list[Division]
     warnings: list[str] = field(default_factory=list)
     llm_calls: int = 0
+    # Exchange requests left unanswered this run. While any are, the labels
+    # are provisional and structure.json is not written.
+    pending: int = 0
 
     def counts(self) -> Counter[str]:
         return Counter(d.kind or "undecided" for d in self.divisions)
@@ -333,6 +337,8 @@ def _label_outline(
     try:
         raw = llm.generate(_outline_prompt(source_lang), table, temperature=0.0)
         rows = extract_json_object(raw).get("rows")
+    except ExchangePending:
+        raise
     except Exception as exc:  # noqa: BLE001 - structure checks must never be fatal
         logger.warning("Outline labelling failed (%s)", exc)
         return False
@@ -498,6 +504,8 @@ def _follow_up(
         answer = extract_json_object(
             llm.generate(_follow_up_prompt(source_lang), question, temperature=0.0)
         )
+    except ExchangePending:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Follow-up for %r failed (%s)", division.title, exc)
         return
@@ -616,15 +624,30 @@ def analyze_structure(
             _restore(division, cache[division.title])
     elif llm is not None and open_rows:
         report.llm_calls += 1
-        if not _label_outline(divisions, llm, source_lang):
+        try:
+            labelled: bool | None = _label_outline(divisions, llm, source_lang)
+        except ExchangePending:
+            report.pending += 1
+            labelled = None
+        if labelled is None:
+            report.warnings.append(
+                "the outline labels are awaiting an exchange answer; this run's outline "
+                "is the numbering rules' provisional one"
+            )
+        elif not labelled:
             report.warnings.append(
                 "The LLM could not label the outline; fell back to the numbering "
                 "rules, unchecked -- read the outline carefully"
             )
         else:
+            # Every follow-up is asked, even after one is pending, so a round
+            # collects as many requests as it can.
             for index, problem in list(conflicts(divisions).items())[:_MAX_FOLLOW_UPS]:
                 report.llm_calls += 1
-                _follow_up(divisions, index, problem, llm, source_lang)
+                try:
+                    _follow_up(divisions, index, problem, llm, source_lang)
+                except ExchangePending:
+                    report.pending += 1
     elif open_rows:
         report.warnings.append(
             "no LLM: parts, chapters and readings were decided by the numbering "
@@ -651,7 +674,9 @@ def analyze_structure(
             "a copy of assets/preamble.tex saved as kit/preamble.tex"
         )
 
-    if cache_path is not None:
+    # A provisional outline must not be cached: the next run would reuse it
+    # instead of asking the questions still waiting for an answer.
+    if cache_path is not None and not report.pending:
         _save_cache(cache_path, divisions)
     return report
 

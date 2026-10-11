@@ -38,6 +38,7 @@ from src.figures import (  # noqa: E402
     write_review,
 )
 from src.kit import CHUNKS_DIRNAME, IMAGE_MAP_NAME, restore_images  # noqa: E402
+from src.llm.exchange import EXIT_PENDING, pending_summary, write_pending  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,6 +105,9 @@ def main(argv: list[str] | None = None) -> int:
     review = write_review(kit_dir, report.records, mapping, report.order)
     print(f"\nwrote {kit_dir / 'figures.json'}")
     print(f"review sheet: {review}")
+    if write_pending(work_dir):
+        print(f"\n{pending_summary(work_dir)}")
+        return EXIT_PENDING
     print(f"next: python scripts/build_pdf.py {kit_dir}")
     return 0
 

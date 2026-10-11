@@ -50,3 +50,42 @@ of the exchange.
 **`translate_book` with an explicit `llm`** still uses it for profiling too
 (that is how the tests drive it); without one, profiling and translation each
 get their own role's model.
+
+## Phase 2 — exchange backend
+
+**Pending exit code is 3.** No script used it (0 success, 1 failure, 2 is
+argparse's usage error). Code 4 is reserved for "a remote job is still
+running" (resumable parse, batch translation).
+
+**`ExchangePending` is a plain `Exception`,** not `RuntimeError`/`ValueError`,
+so the API-era retry loops (tenacity in the translator and figure classifier)
+never retry it and the fail-fast paths never treat it as fatal.
+
+**`prepare_kit.py` stops after the first stage that left requests** (profile,
+then structure, then figures). Each stage's prompts depend on the decisions
+before it: heading levels change the outline table, and structure decisions
+change the text around every image that the classifier sees. Asking a later
+stage's questions on provisional text would produce requests that are never
+reused. A typical book takes four rounds (profile + headings together,
+outline, figures, done), plus one per wave of structure follow-ups; this fits
+the stage2-preparer's six-round limit.
+
+**Both profile calls are asked in the same round** (the profile and the heading
+classification are independent), and every structure follow-up is asked even
+after one is pending. A follow-up whose question changes because an earlier
+follow-up's answer was kept costs one more round; that is rare (it needs two
+conflicting rows) and keeps API-mode behaviour unchanged.
+
+**Nothing provisional is cached.** A profile or outline built while answers are
+pending is not written to `book_profile.json` / `structure.json`, so the next
+round asks the outstanding questions instead of reusing a placeholder.
+
+**Images for classify requests are copied to `llm/images/<sha16>.<ext>`.**
+`VisionLLM` receives bytes, not filenames, so the exchange stores a copy the
+answering agent can `Read`; the request's `images` paths are relative to the
+work dir, as the schema says.
+
+**A malformed answer is permanent until its response file is deleted.** The
+same id finds the same file on every run, so a bad answer cannot loop. To
+re-ask, delete `llm/responses/<id>.txt`. `--reclassify` / `--force-*` discard
+cached *decisions* only; an unchanged prompt still finds its old answer.

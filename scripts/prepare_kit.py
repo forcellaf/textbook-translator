@@ -25,6 +25,13 @@ exact text, so classifying ``## 第13章`` and then merging it into
 ``## 第13章 电势`` would leave the classification unusable.
 
 Reads ``<work-dir>/merged.md`` and writes ``<work-dir>/kit/``.
+
+No-API mode (``LLM_BACKEND=exchange``): an LLM call with no answer yet becomes
+a request file under ``<work-dir>/llm/``. The run stops after the first stage
+that left requests -- profile, structure or figures, in that order, because
+each one's prompts depend on the decisions before it -- writes
+``llm/pending.json`` and exits with code 3. Answer the requests and re-run;
+answered calls are free on the next run.
 """
 
 from __future__ import annotations
@@ -46,6 +53,12 @@ from src.figures import (  # noqa: E402
     write_review,
 )
 from src.kit import build_kit  # noqa: E402
+from src.llm.exchange import (  # noqa: E402
+    EXIT_PENDING,
+    has_pending,
+    pending_summary,
+    write_pending,
+)
 from src.latex import load_preamble, preamble_first_chapter, preamble_for  # noqa: E402
 from src.normalize import normalize  # noqa: E402
 from src.profiler import apply_heading_levels, profile_book  # noqa: E402
@@ -159,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
             f"  headings: {counts['relevelled']} re-levelled, "
             f"{counts['unchanged']} unchanged, {counts['demoted']} demoted to body text"
         )
+        if has_pending(work_dir):
+            return _stop_for_answers(work_dir, "profile")
 
     # ── 4. structure ─────────────────────────────────────────────────────
     llm = None
@@ -192,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{rewritten['unnumbered section']} section(s) of unnumbered chapters as \\section*"
     )
     print(f"  check the outline above; correct it in {work_dir / STRUCTURE_FILENAME}")
+    if has_pending(work_dir):
+        return _stop_for_answers(work_dir, "structure")
 
     # ── 5. tables ────────────────────────────────────────────────────────
     text, reports = convert_html_tables(text)
@@ -220,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
     if removed:
         print(f"  removed {removed} dropped image reference(s) from the text")
     print(f"  correct any of them in {kit_dir / FIGURES_NAME} (set \"by\": \"manual\")")
+    if has_pending(work_dir):
+        return _stop_for_answers(work_dir, "figures")
+    write_pending(work_dir)  # nothing pending: clears a stale manifest
 
     (work_dir / PREPARED_NAME).write_text(text, encoding="utf-8")
 
@@ -244,6 +264,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  save each reply (LaTeX) to {kit_dir / 'translated'}/NNN.tex")
     print(f"\nnext: python scripts/lint_translation.py {kit_dir}")
     return 0
+
+
+def _stop_for_answers(work_dir: Path, stage: str) -> int:
+    """End a no-API round: record the requests, say so, exit 3."""
+    write_pending(work_dir)
+    print(f"\nstopped after {stage}: {pending_summary(work_dir)}")
+    return EXIT_PENDING
 
 
 if __name__ == "__main__":

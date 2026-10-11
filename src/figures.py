@@ -75,6 +75,7 @@ from src.config import (
     VISION_MIN_INTERVAL_SECONDS,
 )
 from src.llm.base import VisionLLM, image_mime_type
+from src.llm.exchange import ExchangePending
 from src.profiler import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,8 @@ FLAG_MALFORMED = "malformed-reply"
 FLAG_ERROR = "classifier-error"
 FLAG_UNCLASSIFIED = "unclassified"
 FLAG_WOULD_DROP = "would-drop"
+# No-API mode: the classifier's answer is an exchange request not answered yet.
+FLAG_PENDING = "exchange-pending"
 
 MODE_CLASSIFY = "classify"
 MODE_DRY_RUN = "dry-run"
@@ -629,6 +632,9 @@ def classify_image(vision: VisionLLM, image: bytes, site: ImageSite) -> Verdict:
         )
     except ValueError as exc:
         raise FatalClassifierError(str(exc)) from exc
+    except ExchangePending:
+        # Kept, like every unanswered image; the answer arrives next round.
+        return Verdict(None, None, "awaiting an exchange answer", FLAG_PENDING)
     except Exception as exc:  # noqa: BLE001 - fail open on anything else
         return Verdict(None, None, f"API failure: {exc}"[:300], FLAG_ERROR)
     return parse_verdict(raw)
@@ -682,7 +688,7 @@ def decide(
     label, confidence = record.label, record.confidence
 
     if mode == MODE_OFF or label is None:
-        if not any(f in record.flags for f in (FLAG_MALFORMED, FLAG_ERROR)):
+        if not any(f in record.flags for f in (FLAG_MALFORMED, FLAG_ERROR, FLAG_PENDING)):
             record.flags.append(FLAG_UNCLASSIFIED)
         return
     if label == FIGURE:
@@ -708,6 +714,7 @@ class FiguresReport:
     mode: str
     calls: int = 0
     stopped: str | None = None  # why classification stopped early
+    pending: int = 0  # exchange requests awaiting an answer
 
     def _ordered(self) -> list[tuple[str, FigureRecord]]:
         return [(name, self.records[name]) for name in self.order if name in self.records]
@@ -745,6 +752,8 @@ class FiguresReport:
             f"{len(self.dropped)} dropped, {len(self.flagged)} flagged for review; "
             f"by {dict(sorted(by.items()))}; {self.calls} vision call(s)"
         ]
+        if self.pending:
+            lines.append(f"  {self.pending} image(s) awaiting an exchange answer (kept for now)")
         if self.stopped:
             lines.append(f"  classification stopped early: {self.stopped}")
         if self.mode != MODE_OFF:
@@ -843,8 +852,10 @@ def build_figures(
 
     in_gap = numbering_gaps(sites, numbers)
 
-    # Pass 2: classify what is left, reusing cached labels.
+    # Pass 2: classify what is left, reusing cached labels. On the exchange
+    # backend every unanswered image becomes a request in this one pass.
     calls = 0
+    pending = 0
     stopped: str | None = None
     last_call = 0.0
     for site in sites:
@@ -873,10 +884,13 @@ def build_figures(
                     logger.error("Vision classification stopped: %s", exc)
                     verdict = Verdict(None, None, f"not classified: {exc}"[:300], FLAG_ERROR)
                 else:
-                    calls += 1
-                    last_call = time.monotonic()
-                    if calls % 25 == 0:
-                        logger.info("Classified %d image(s)", calls)
+                    if verdict.flag == FLAG_PENDING:
+                        pending += 1
+                    else:
+                        calls += 1
+                        last_call = time.monotonic()
+                        if calls % 25 == 0:
+                            logger.info("Classified %d image(s)", calls)
             record.label, record.confidence, record.reason = (
                 verdict.label,
                 verdict.confidence,
@@ -894,7 +908,7 @@ def build_figures(
     ordered = [s.name for s in sites]
     order = ordered + [n for n in records if n not in set(ordered)]
     records = {name: records[name] for name in order}
-    return FiguresReport(records, order, mode, calls, stopped)
+    return FiguresReport(records, order, mode, calls, stopped, pending)
 
 
 def figures_step(

@@ -30,6 +30,7 @@ from pathlib import Path
 
 from src.config import SOURCE_LANG, TARGET_LANG
 from src.llm.base import BaseLLM
+from src.llm.exchange import ExchangePending
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +414,10 @@ def classify_headings(
             _build_heading_prompt(source_lang), "\n".join(headings), temperature=0.0
         )
         parsed = extract_json_object(raw)
+    except ExchangePending:
+        # Not a failure: the answer is coming. `profile_book` must not cache
+        # a profile with empty heading levels in the meantime.
+        raise
     except Exception as exc:  # noqa: BLE001 - classification must never be fatal
         logger.warning(
             "Heading classification failed (%s); leaving heading levels as the "
@@ -579,18 +584,35 @@ def profile_book(
 
             llm = get_llm(ROLE_PROFILE, work_dir=work_dir)
 
-        raw = llm.generate(
-            _build_profile_prompt(source_lang, target_lang),
-            _sample_text(text),
-            temperature=0.2,
-        )
-        profile = BookProfile.from_dict(extract_json_object(raw))
+        # On the exchange backend both calls are made even when the first
+        # one is still unanswered, so one round collects both requests.
+        pending: ExchangePending | None = None
+        profile = BookProfile.generic()
+        try:
+            raw = llm.generate(
+                _build_profile_prompt(source_lang, target_lang),
+                _sample_text(text),
+                temperature=0.2,
+            )
+            profile = BookProfile.from_dict(extract_json_object(raw))
+        except ExchangePending as exc:
+            pending = exc
         if with_headings:
-            # Isolated from the profile call above: `classify_headings` never
-            # raises, so a heading failure costs the heading levels only, not
-            # the glossary that took a full book read to produce.
-            levels, non_headings = classify_headings(text, llm, source_lang=source_lang)
-            profile = replace(profile, heading_levels=levels, non_headings=non_headings)
+            # Isolated from the profile call above: `classify_headings` only
+            # raises for a pending exchange answer, so a heading failure costs
+            # the heading levels only, not the glossary that took a full book
+            # read to produce.
+            try:
+                levels, non_headings = classify_headings(text, llm, source_lang=source_lang)
+                profile = replace(profile, heading_levels=levels, non_headings=non_headings)
+            except ExchangePending as exc:
+                pending = pending or exc
+        if pending is not None:
+            logger.info(
+                "Book profile is awaiting exchange answers; using a generic profile "
+                "for this run (not cached)"
+            )
+            return BookProfile.generic()
     except Exception as exc:  # noqa: BLE001 - profiling must never be fatal
         logger.warning(
             "Book profiling failed (%s); falling back to a generic profile. "
