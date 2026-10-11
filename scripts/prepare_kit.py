@@ -9,12 +9,12 @@ Stages, in order -- the order matters:
   1. normalize   merge split headings; report anything else short
   2. profile     one cached LLM call: glossary + a level per heading
   3. re-level    apply that classification (pure, no LLM)
-  4. structure   parts / chapters / readings: DeepSeek labels the whole outline
+  4. structure   parts / chapters / readings: Claude labels the whole outline
                  from the numbering under each heading, code cross-checks it
                  and follows up on conflicts. Headings become final \\part /
                  \\chapter / \\chapter* commands, so the translator never guesses
   5. tables      HTML -> pipe tables; warn and skip degenerate ones
-  6. figures     kit/figures.json: each image's source number and width; DeepSeek
+  6. figures     kit/figures.json: each image's source number and width; Claude
                  vision labels the uncaptioned ones, and a confident decoration
                  is dropped from the text before the translator sees it
   7. tokenize    image paths -> IMG_nnnn
@@ -82,8 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force-structure",
         action="store_true",
-        help="ask DeepSeek again about headings it already decided (manual "
-        "entries in structure.json are always kept)",
+        help="ask Claude again about headings it already decided (manual and "
+        "agent entries in structure.json are always kept)",
     )
     parser.add_argument(
         "--fix-math-spacing",
@@ -163,10 +163,11 @@ def main(argv: list[str] | None = None) -> int:
     # ── 4. structure ─────────────────────────────────────────────────────
     llm = None
     if not args.no_profile:
+        from src.config import ROLE_STRUCTURE
         from src.llm.factory import get_llm
 
         try:
-            llm = get_llm()
+            llm = get_llm(ROLE_STRUCTURE, work_dir=work_dir)
         except Exception as exc:  # noqa: BLE001 - rules alone still decide most headings
             print(f"\nstructure: no LLM available ({exc}); using the numbering rules only")
     report = analyze_structure(
@@ -180,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"\nstructure: {kinds['part']} part(s), {kinds['chapter']} chapter(s), "
         f"{kinds['reading']} reading(s), {kinds['other']} front/back matter, "
-        f"{kinds['undecided']} undecided; {report.llm_calls} DeepSeek call(s)"
+        f"{kinds['undecided']} undecided; {report.llm_calls} LLM call(s)"
     )
     print(render_outline(report))
     for warning in report.warnings:

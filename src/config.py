@@ -6,12 +6,13 @@ environment variables BEFORE any network-using library is imported, validates
 required secrets, and exposes typed path/setting constants used across the
 whole pipeline.
 
-IMPORTANT: This module must be imported (directly or transitively) before any
-LLM provider SDK or MinerU code runs, since it is responsible for setting
+IMPORTANT: This module must be imported (directly or transitively) before the
+Anthropic SDK or MinerU code runs, since it is responsible for setting
 HTTP_PROXY / HTTPS_PROXY / HF_ENDPOINT in os.environ.
 """
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,15 +40,7 @@ for _var in ("HTTP_PROXY", "HTTPS_PROXY", "HF_ENDPOINT"):
     if _value:
         os.environ[_var] = _value
 
-# ── Secrets ─────────────────────────────────────────────────────────────────
-# Keys are read here but NOT validated here; see "Provider credentials" below,
-# which validates only the key belonging to the active LLM_PROVIDER.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-
 # ── Settings ─────────────────────────────────────────────────────────────
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek")
 SOURCE_LANG: str = os.getenv("SOURCE_LANG", "Chinese")
 TARGET_LANG: str = os.getenv("TARGET_LANG", "English")
 MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "3000"))
@@ -73,8 +66,8 @@ SOURCE_RESIDUE_THRESHOLD: float = float(os.getenv("SOURCE_RESIDUE_THRESHOLD", "0
 #
 # MINERU_TOKEN is not validated here because not every invocation needs it
 # (e.g. running only lint or the build). `src.mineru_api.MinerUClient`
-# validates it lazily, at construction time -- the same provider-conditional
-# style used for the LLM keys below.
+# validates it lazily, at construction time. ANTHROPIC_API_KEY is the same:
+# no-API mode (a Claude Code subscription) runs without one.
 MINERU_TOKEN: str | None = os.getenv("MINERU_TOKEN") or os.getenv("MINERU_API_KEY")
 MINERU_API_BASE: str = os.getenv("MINERU_API_BASE", "https://mineru.net/api/v4").rstrip("/")
 MINERU_POLL_INTERVAL_SECONDS: int = int(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "10"))
@@ -93,16 +86,94 @@ MINERU_UPLOAD_TIMEOUT_SECONDS: float = float(os.getenv("MINERU_UPLOAD_TIMEOUT_SE
 # Free-tier quota, used only to log how much of the day's budget a book eats.
 MINERU_DAILY_PAGE_QUOTA: int = int(os.getenv("MINERU_DAILY_PAGE_QUOTA", "1000"))
 
-# ── DeepSeek (translation) ──────────────────────────────────────────────────
-DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+# ── Claude (every LLM call) ─────────────────────────────────────────────────
+# Claude is the only LLM provider. MinerU stays as the parser: it is OCR, not
+# an LLM provider.
+#
+# Every call site names a *role*, and each role has its own model, effort and
+# max_tokens. The defaults are the decided table in the README's "Agent mode"
+# section; any of them can be overridden per role with
+# CLAUDE_MODEL_<ROLE> / CLAUDE_EFFORT_<ROLE> / CLAUDE_MAX_TOKENS_<ROLE>.
+#
+# max_tokens is generous on purpose: adaptive thinking counts toward it, and a
+# reply cut off at the cap is treated as a failure, never as an answer
+# (`src.llm.providers.anthropic`). Translation is the extreme case -- replies
+# measured up to ~36k tokens of LaTeX, plus thinking on top.
+ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
 
-# ── DeepSeek vision (figure classification, src.figures) ────────────────────
-# A separate model from DEEPSEEK_MODEL: the text model takes no image input,
-# so images are only ever sent to this one. Same key and base URL -- no
-# second credential. See https://api-docs.deepseek.com/guides/vision.
-DEEPSEEK_VISION_MODEL: str = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-flash")
+ROLE_PROFILE = "profile"
+ROLE_STRUCTURE = "structure"
+ROLE_CLASSIFY = "classify"
+ROLE_TRANSLATE = "translate"
+ROLES: tuple[str, ...] = (ROLE_PROFILE, ROLE_STRUCTURE, ROLE_CLASSIFY, ROLE_TRANSLATE)
+
+_ROLE_DEFAULTS: dict[str, tuple[str, str, int]] = {
+    ROLE_PROFILE: ("claude-sonnet-5-5", "medium", 32_000),
+    ROLE_STRUCTURE: ("claude-sonnet-5-5", "medium", 32_000),
+    ROLE_CLASSIFY: ("claude-haiku-5-5", "low", 4_000),
+    ROLE_TRANSLATE: ("claude-haiku-5-5", "medium", 96_000),
+}
+EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
+@dataclass(frozen=True)
+class RoleConfig:
+    """Which model answers one role, at what effort, with what output cap."""
+
+    role: str
+    model: str
+    effort: str
+    max_tokens: int
+
+
+def role_config(role: str) -> RoleConfig:
+    """The model, effort and max_tokens for ``role``, environment first.
+
+    Read at call time rather than import time, so a test (or the Agent SDK
+    launcher) can set ``CLAUDE_MODEL_<ROLE>`` after this module was imported.
+    """
+    if role not in _ROLE_DEFAULTS:
+        raise ValueError(f"Unknown LLM role {role!r}; expected one of {', '.join(ROLES)}")
+    model, effort, max_tokens = _ROLE_DEFAULTS[role]
+    key = role.upper()
+    effort = os.getenv(f"CLAUDE_EFFORT_{key}", effort).strip().lower()
+    if effort not in EFFORTS:
+        raise ValueError(f"CLAUDE_EFFORT_{key}={effort!r} is not one of {', '.join(EFFORTS)}")
+    return RoleConfig(
+        role=role,
+        model=os.getenv(f"CLAUDE_MODEL_{key}", model).strip(),
+        effort=effort,
+        max_tokens=int(os.getenv(f"CLAUDE_MAX_TOKENS_{key}", str(max_tokens))),
+    )
+
+
+def llm_backend() -> str:
+    """``anthropic`` (Python calls the Messages API) or ``exchange`` (Python
+    writes request files and an agent answers them -- see `src.llm.exchange`).
+
+    ``LLM_BACKEND`` wins when set. Otherwise the backend follows the key: no
+    ``ANTHROPIC_API_KEY`` means a Claude Code subscription with no API access,
+    which is exactly what the exchange is for. Read at call time for the same
+    reason as `role_config`.
+    """
+    explicit = os.getenv("LLM_BACKEND", "").strip().lower()
+    if explicit:
+        if explicit not in ("anthropic", "exchange"):
+            raise ValueError(f"LLM_BACKEND={explicit!r} must be 'anthropic' or 'exchange'")
+        return explicit
+    return "anthropic" if os.getenv("ANTHROPIC_API_KEY") else "exchange"
+
+
+# Server-side refusal fallback on the Sonnet/Opus roles: if a safety
+# classifier declines a request, the API re-runs it on a fallback model inside
+# the same call. `default` lets the API pick by refusal category; `off`
+# disables it. Haiku has no server-side fallback, and the Batch API rejects
+# the parameter, so neither ever sends it.
+CLAUDE_REFUSAL_FALLBACK: str = os.getenv("CLAUDE_REFUSAL_FALLBACK", "default").strip().lower()
+# The SDK's own retry of 429/5xx/connection errors. Callers that retry on
+# top (the translator, the figure classifier) multiply this, so keep it low.
+ANTHROPIC_MAX_RETRIES: int = int(os.getenv("ANTHROPIC_MAX_RETRIES", "2"))
+
 # Optional pause between vision calls, for an account with a low rate limit.
 # 429s are retried regardless; this only spaces the calls out up front.
 VISION_MIN_INTERVAL_SECONDS: float = float(os.getenv("VISION_MIN_INTERVAL_SECONDS", "0"))
@@ -110,24 +181,6 @@ VISION_MIN_INTERVAL_SECONDS: float = float(os.getenv("VISION_MIN_INTERVAL_SECOND
 # decoration with at least this confidence (and the numbering-gap guard
 # passes). Dropping a real figure is the expensive error, so this is high.
 FIGURE_DROP_CONFIDENCE: float = float(os.getenv("FIGURE_DROP_CONFIDENCE", "0.9"))
-
-# ── Provider credentials ────────────────────────────────────────────────────
-# Only the active provider's key is required. Validating every key would block
-# a DeepSeek-only user (the common case now) on a missing Gemini key they will
-# never use; validating none would defer a missing key to a confusing SDK error
-# mid-run. Providers not listed here are rejected by `src.llm.factory.get_llm`.
-_PROVIDER_KEYS: dict[str, str | None] = {
-    "gemini": GEMINI_API_KEY,
-    "deepseek": DEEPSEEK_API_KEY,
-}
-
-_active_key_name = f"{LLM_PROVIDER.upper()}_API_KEY"
-if LLM_PROVIDER in _PROVIDER_KEYS and not _PROVIDER_KEYS[LLM_PROVIDER]:
-    raise ValueError(
-        f"{_active_key_name} is missing but LLM_PROVIDER={LLM_PROVIDER!r}. Create a "
-        f"`.env` file in the project root (copy from `.env.example`) and set "
-        f"{_active_key_name}=<your-key>."
-    )
 
 # ── PDF splitting (src.splitter / src.merger / src.chapter_splitter) ───────
 # MinerU's Precision Extract API hard-limits uploads to <= 200 pages and

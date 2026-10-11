@@ -1,9 +1,9 @@
 """
 The translation stage: Markdown in, translated LaTeX out.
 
-This is the automated path, for a book handed to an API model unattended.
-The reviewed path -- where the chunks are pasted into AI Studio by hand -- is
-``src.kit``. Both use the same system prompt asset and the same assembly, so
+This is the automated path, for a book handed to the Claude API unattended
+(``LLM_BACKEND=anthropic``). The kit path -- where each chunk is translated by
+a ``chunk-translator`` agent, a batch, or by hand -- is ``src.kit``. Both use the same system prompt asset and the same assembly, so
 a book can move between them.
 
 Layout
@@ -361,8 +361,9 @@ def _diagnose(
 def _generate_with_retry(llm: BaseLLM, system_prompt: str, user_text: str) -> str:
     """One LLM call, with the full transient-failure retry schedule.
 
-    ``GeminiProvider`` raises ``RuntimeError`` for every API-level failure, so
-    that is what is retried. Exhausting the schedule converts to
+    The provider raises ``RuntimeError`` for every transient API failure
+    (including a reply truncated at ``max_tokens``), so that is what is
+    retried; a permanent one is a ``ValueError`` and propagates at once. Exhausting the schedule converts to
     ``TranslationError``, which callers must let propagate rather than fold
     into a heal loop.
     """
@@ -466,9 +467,10 @@ def translate_markdown(
         return ""
 
     if llm is None:
+        from src.config import ROLE_TRANSLATE
         from src.llm.factory import get_llm
 
-        llm = get_llm()
+        llm = get_llm(ROLE_TRANSLATE)
 
     translated: list[str] = []
     for index, chunk in enumerate(chunks, start=1):
@@ -555,15 +557,19 @@ def translate_book(
     ]
 
     if pending:
+        # A caller-supplied llm answers every role (that is how the tests
+        # drive this); otherwise each role gets its own model from config.
+        profile_llm = llm
         if llm is None:
+            from src.config import ROLE_TRANSLATE
             from src.llm.factory import get_llm
 
-            llm = get_llm()
+            llm = get_llm(ROLE_TRANSLATE)
         if profile is None and use_profile:
             profile = profile_book(
                 merged_md_path,
                 work_dir,
-                llm=llm,
+                llm=profile_llm,
                 source_lang=source_lang,
                 target_lang=target_lang,
             )

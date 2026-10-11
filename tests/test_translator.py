@@ -337,7 +337,7 @@ def test_untranslated_output_returns_last_response_after_heals_exhausted(caplog)
 
 
 def test_translation_error_after_retries_are_exhausted() -> None:
-    llm = FakeLLM([RuntimeError("Gemini API call failed: 401 invalid key")])
+    llm = FakeLLM([RuntimeError("Claude API call failed: 401 invalid key")])
 
     with pytest.raises(TranslationError, match="invalid key"):
         translate_chunk(_long_text("source"), llm=llm)

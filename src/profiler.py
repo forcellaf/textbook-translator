@@ -574,9 +574,10 @@ def profile_book(
             raise ValueError(f"{merged_md_path} is empty")
 
         if llm is None:
+            from src.config import ROLE_PROFILE
             from src.llm.factory import get_llm
 
-            llm = get_llm()
+            llm = get_llm(ROLE_PROFILE, work_dir=work_dir)
 
         raw = llm.generate(
             _build_profile_prompt(source_lang, target_lang),

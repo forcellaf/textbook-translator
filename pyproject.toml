@@ -7,9 +7,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "google-genai>=1.0.0,<2.0.0",
+    "anthropic>=1.13.0",
     "httpx>=0.27",
-    "openai>=1.0.0",
     "pymupdf>=1.24",
     "python-dotenv>=1.2.2",
     "tenacity>=9.1.4",
@@ -18,9 +17,13 @@ dependencies = [
 # `magic-pdf[full]` was removed along with the local parser: it is the source
 # of the historical parse defects, and it dragged in torch, paddle and
 # pycocotools for a code path nothing calls any more. `pymupdf` and `httpx`
-# were previously transitive dependencies of it and of `openai`; they are
-# declared explicitly now because `src.splitter` and `src.mineru_api` import
+# are declared explicitly because `src.splitter` and `src.mineru_api` import
 # them directly.
+#
+# `anthropic` is the only LLM SDK. It runs on `httpx2` (the maintained fork of
+# `httpx`, published by Pydantic), not `httpx`: MinerU traffic stays on
+# `httpx`, Claude traffic is on `httpx2`, and the provider tests fake the
+# latter with `httpx2.MockTransport` -- hence `httpx2` in the dev group.
 #
 # A LaTeX distribution (TeX Live or MiKTeX, providing `pdflatex`) is the one
 # dependency this project does NOT install through Python. The build shells
@@ -32,5 +35,6 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.0",
     "pytest>=9.1.1",
 ]

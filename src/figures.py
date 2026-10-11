@@ -912,7 +912,7 @@ def figures_step(
         from src.llm.factory import get_vision_llm
 
         try:
-            vision = get_vision_llm()
+            vision = get_vision_llm(work_dir=work_dir)
         except Exception as exc:  # noqa: BLE001 - fail open: keep everything
             note = f"no vision model available ({exc}); uncaptioned images are kept"
 

@@ -18,14 +18,14 @@ a chapter's sections and figures carry its number (12.1, 图12.3), a
 reading's are lettered (G.1, 图G.3) -- and how that compares with its
 siblings.
 
-Who decides: DeepSeek, checked by code
---------------------------------------
+Who decides: Claude, checked by code
+------------------------------------
 Every book has its own conventions, so no fixed rule may decide. The steps:
 
 1. **Evidence** (code, book-neutral): for each top-level heading, the number
    prefixes of its sub-headings, of the caption line after each image
    (whatever the caption word is), and of its equation tags.
-2. **One DeepSeek call labels the whole outline** -- every top-level heading
+2. **One Claude call labels the whole outline** -- every top-level heading
    in one table with its evidence -- so it can compare siblings: 25 rows with
    sections numbered by chapter and 5 with lettered ones are two kinds.
 3. **Code cross-checks the labels** against what holds for any book: chapter
@@ -589,7 +589,7 @@ def analyze_structure(
         llm: Labels the outline. ``None`` falls back to the numbering rules,
             unchecked, and says so.
         cache_path: ``structure.json``. Manual entries always win; earlier
-            DeepSeek labels are reused, without a call, unless ``force`` or a
+            LLM labels are reused, without a call, unless ``force`` or a
             heading is new.
         first_chapter: The chapter number the preamble starts at, to warn
             when the book starts somewhere else.
@@ -618,7 +618,7 @@ def analyze_structure(
         report.llm_calls += 1
         if not _label_outline(divisions, llm, source_lang):
             report.warnings.append(
-                "DeepSeek could not label the outline; fell back to the numbering "
+                "The LLM could not label the outline; fell back to the numbering "
                 "rules, unchecked -- read the outline carefully"
             )
         else:
