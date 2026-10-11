@@ -25,3 +25,8 @@ data/output/*
 !data/output/.gitkeep
 logs/*
 !logs/.gitkeep
+
+# Claude Code: per-user settings and the app's worktrees. The shared
+# .claude/settings.json, skills and agents are tracked.
+.claude/settings.local.json
+.claude/worktrees/

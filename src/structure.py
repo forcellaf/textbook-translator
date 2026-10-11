@@ -18,14 +18,14 @@ a chapter's sections and figures carry its number (12.1, 图12.3), a
 reading's are lettered (G.1, 图G.3) -- and how that compares with its
 siblings.
 
-Who decides: DeepSeek, checked by code
---------------------------------------
+Who decides: Claude, checked by code
+------------------------------------
 Every book has its own conventions, so no fixed rule may decide. The steps:
 
 1. **Evidence** (code, book-neutral): for each top-level heading, the number
    prefixes of its sub-headings, of the caption line after each image
    (whatever the caption word is), and of its equation tags.
-2. **One DeepSeek call labels the whole outline** -- every top-level heading
+2. **One Claude call labels the whole outline** -- every top-level heading
    in one table with its evidence -- so it can compare siblings: 25 rows with
    sections numbered by chapter and 5 with lettered ones are two kinds.
 3. **Code cross-checks the labels** against what holds for any book: chapter
@@ -44,8 +44,9 @@ Every book has its own conventions, so no fixed rule may decide. The steps:
    into headings, go back to being paragraphs.
 
 Decisions are cached in ``<work-dir>/structure.json``, which is meant to be
-opened and corrected: set an entry's ``"by"`` to ``"manual"`` and its
-``"kind"`` (and ``"number"``) win on the next run.
+opened and corrected: set an entry's ``"by"`` to ``"manual"`` (a person) or
+``"agent"`` (the unattended orchestrator) and its ``"kind"`` (and
+``"number"``) win on the next run -- see `src.provenance`.
 
 With no LLM, or when the outline call fails, the numbering rules are the
 fallback and the outline says so. Nothing here raises.
@@ -62,7 +63,9 @@ from pathlib import Path
 
 from src.config import SOURCE_LANG
 from src.llm.base import BaseLLM
+from src.llm.exchange import ExchangePending
 from src.profiler import extract_json_object
+from src.provenance import is_protected
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +134,7 @@ class Division:
     kind: str | None = None  # part | chapter | reading | other; None = undecided
     number: int | None = None  # chapter number, when known
     clean_title: str = ""  # the title without its 第12章 / Part II label
-    decided_by: str = ""  # llm | follow-up | manual | rules
+    decided_by: str = ""  # llm | follow-up | manual | agent | rules
     reason: str = ""
     rule_kind: str | None = None  # the numbering rules' opinion
     rule_number: int | None = None
@@ -160,6 +163,9 @@ class StructureReport:
     divisions: list[Division]
     warnings: list[str] = field(default_factory=list)
     llm_calls: int = 0
+    # Exchange requests left unanswered this run. While any are, the labels
+    # are provisional and structure.json is not written.
+    pending: int = 0
 
     def counts(self) -> Counter[str]:
         return Counter(d.kind or "undecided" for d in self.divisions)
@@ -333,6 +339,8 @@ def _label_outline(
     try:
         raw = llm.generate(_outline_prompt(source_lang), table, temperature=0.0)
         rows = extract_json_object(raw).get("rows")
+    except ExchangePending:
+        raise
     except Exception as exc:  # noqa: BLE001 - structure checks must never be fatal
         logger.warning("Outline labelling failed (%s)", exc)
         return False
@@ -346,7 +354,7 @@ def _label_outline(
         index = answer.get("row")
         if isinstance(index, int) and 1 <= index <= len(divisions):
             division = divisions[index - 1]
-            if division.decided_by != "manual" and _apply_answer(division, answer, "llm"):
+            if not is_protected(division.decided_by) and _apply_answer(division, answer, "llm"):
                 labelled += 1
     return labelled > 0
 
@@ -459,7 +467,7 @@ def conflicts(divisions: list[Division]) -> dict[int, str]:
             if following is None or following.kind == PART:
                 add(index, "a part with no chapter after it")
 
-    return {i: p for i, p in found.items() if divisions[i].decided_by != "manual"}
+    return {i: p for i, p in found.items() if not is_protected(divisions[i].decided_by)}
 
 
 def _follow_up_prompt(source_lang: str) -> str:
@@ -498,6 +506,8 @@ def _follow_up(
         answer = extract_json_object(
             llm.generate(_follow_up_prompt(source_lang), question, temperature=0.0)
         )
+    except ExchangePending:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Follow-up for %r failed (%s)", division.title, exc)
         return
@@ -566,7 +576,7 @@ def _fall_back_to_rules(divisions: list[Division]) -> None:
             if division.rule_kind == CHAPTER:
                 division.number = division.rule_number
             continue
-        if division.decided_by == "manual" or division.kind is not None:
+        if is_protected(division.decided_by) or division.kind is not None:
             continue
         if division.rule_kind:
             division.kind, division.number = division.rule_kind, division.rule_number
@@ -588,8 +598,8 @@ def analyze_structure(
         text: The book's Markdown, with heading levels already corrected.
         llm: Labels the outline. ``None`` falls back to the numbering rules,
             unchecked, and says so.
-        cache_path: ``structure.json``. Manual entries always win; earlier
-            DeepSeek labels are reused, without a call, unless ``force`` or a
+        cache_path: ``structure.json``. Manual and agent entries always win; earlier
+            LLM labels are reused, without a call, unless ``force`` or a
             heading is new.
         first_chapter: The chapter number the preamble starts at, to warn
             when the book starts somewhere else.
@@ -601,10 +611,10 @@ def analyze_structure(
     for division in divisions:
         rule_opinion(division)
         entry = cache.get(division.title, {})
-        if entry.get("by") == "manual" and entry.get("kind") in KINDS:
+        if is_protected(entry.get("by")) and entry.get("kind") in KINDS:
             _restore(division, entry)
 
-    open_rows = [d for d in divisions if d.decided_by != "manual"]
+    open_rows = [d for d in divisions if not is_protected(d.decided_by)]
     reusable = not force and open_rows and all(
         cache.get(d.title, {}).get("by") in ("llm", "follow-up")
         and cache[d.title].get("kind") in KINDS
@@ -616,15 +626,30 @@ def analyze_structure(
             _restore(division, cache[division.title])
     elif llm is not None and open_rows:
         report.llm_calls += 1
-        if not _label_outline(divisions, llm, source_lang):
+        try:
+            labelled: bool | None = _label_outline(divisions, llm, source_lang)
+        except ExchangePending:
+            report.pending += 1
+            labelled = None
+        if labelled is None:
             report.warnings.append(
-                "DeepSeek could not label the outline; fell back to the numbering "
+                "the outline labels are awaiting an exchange answer; this run's outline "
+                "is the numbering rules' provisional one"
+            )
+        elif not labelled:
+            report.warnings.append(
+                "The LLM could not label the outline; fell back to the numbering "
                 "rules, unchecked -- read the outline carefully"
             )
         else:
+            # Every follow-up is asked, even after one is pending, so a round
+            # collects as many requests as it can.
             for index, problem in list(conflicts(divisions).items())[:_MAX_FOLLOW_UPS]:
                 report.llm_calls += 1
-                _follow_up(divisions, index, problem, llm, source_lang)
+                try:
+                    _follow_up(divisions, index, problem, llm, source_lang)
+                except ExchangePending:
+                    report.pending += 1
     elif open_rows:
         report.warnings.append(
             "no LLM: parts, chapters and readings were decided by the numbering "
@@ -651,7 +676,9 @@ def analyze_structure(
             "a copy of assets/preamble.tex saved as kit/preamble.tex"
         )
 
-    if cache_path is not None:
+    # A provisional outline must not be cached: the next run would reuse it
+    # instead of asking the questions still waiting for an answer.
+    if cache_path is not None and not report.pending:
         _save_cache(cache_path, divisions)
     return report
 
@@ -728,7 +755,9 @@ def render_outline(report: StructureReport) -> str:
         else:
             label, indent = "   ?", "  "
 
-        if division.rule_kind is None or division.decided_by in ("rules", "manual"):
+        if division.rule_kind is None or division.decided_by == "rules" or is_protected(
+            division.decided_by
+        ):
             check = ""
         elif division.rule_kind == division.kind:
             check = " (rules agree)"

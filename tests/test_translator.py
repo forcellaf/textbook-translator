@@ -15,6 +15,7 @@ from src.config import API_MAX_RETRIES, MAX_HEAL_ATTEMPTS
 from src.latex import GLOSSARY_PLACEHOLDER, SYSTEM_PROMPT_PATH
 from src.llm.base import BaseLLM
 from src.profiler import BookProfile
+from src.lint import SENTINEL
 from src.translator import (
     TranslationError,
     chunk_markdown,
@@ -22,6 +23,10 @@ from src.translator import (
     translate_chunk,
     translate_markdown,
 )
+
+
+class Truncated(str):
+    """A scripted reply that was cut off: no sentinel is appended."""
 
 
 class FakeLLM(BaseLLM):
@@ -43,11 +48,15 @@ class FakeLLM(BaseLLM):
     def generate(self, system_prompt: str, user_text: str, temperature: float = 0.7) -> str:
         self.calls.append((system_prompt, user_text, temperature))
         if self.responses is None:
-            return f"[EN] {user_text}"
+            return f"[EN] {user_text}\n{SENTINEL}"
         response = self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
         if isinstance(response, Exception):
             raise response
-        return str(response)
+        # The model is told to end every reply with the sentinel; a scripted
+        # reply does too, unless it is empty or is a `Truncated` one.
+        if isinstance(response, Truncated) or not str(response).strip():
+            return str(response)
+        return f"{response}\n{SENTINEL}"
 
     @property
     def call_count(self) -> int:
@@ -337,7 +346,7 @@ def test_untranslated_output_returns_last_response_after_heals_exhausted(caplog)
 
 
 def test_translation_error_after_retries_are_exhausted() -> None:
-    llm = FakeLLM([RuntimeError("Gemini API call failed: 401 invalid key")])
+    llm = FakeLLM([RuntimeError("Claude API call failed: 401 invalid key")])
 
     with pytest.raises(TranslationError, match="invalid key"):
         translate_chunk(_long_text("source"), llm=llm)
@@ -500,3 +509,16 @@ def test_fully_translated_book_costs_zero_llm_calls(tmp_path: Path) -> None:
     assert output.exists()
 
 
+
+
+def test_a_reply_without_the_sentinel_is_healed_as_cut_off() -> None:
+    """For a reply from any source, the sentinel is the deterministic
+    truncation check: a reply of plausible length without it is re-asked."""
+    full = "\\section{Electric Charge}\n\n" + "Charge is conserved. " * 40
+    llm = FakeLLM([Truncated(full), full])
+    result = translate_chunk("## 12.1 电荷\n\n" + "电荷守恒。" * 40, llm=llm)
+
+    assert llm.call_count == 2
+    assert SENTINEL in llm.calls[1][0]  # the heal prompt names the missing line
+    assert result == full.strip()
+    assert SENTINEL not in result  # stripped before the fragment is used

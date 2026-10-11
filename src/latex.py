@@ -366,7 +366,89 @@ def validate_fragment(tex: str) -> list[str]:
     return issues
 
 
+# ── Wide tables ─────────────────────────────────────────────────────────────
+#
+# A translated table is often wider than the source's: English cell text is
+# longer than Chinese, and a `tabular` with `l` columns never wraps, so the
+# last column runs off the page (a real book's "Main applications" column was
+# cut in half). Every outermost `tabular` is therefore wrapped at assembly in
+# `\bookfittable{...}`: the table is set in a box, and only a box wider than
+# the line is scaled down to `\linewidth`. A table that fits is untouched.
+#
+# The macro needs only graphicx, which every preamble loads (adjustbox's
+# `max width` does the same but is not in every TeX installation), and its
+# definition is inserted with the body, so a book's own kit/preamble.tex --
+# a copy that predates this -- works too. Applied at assembly, like the
+# figure records, so existing translations are fixed by rebuilding.
+
+TABLE_FIT_MACRO = "bookfittable"
+TABLE_FIT_SUPPORT = (
+    "% Tables wider than the line are scaled to fit it (src/latex.py, fit_wide_tables).\n"
+    "\\newsavebox{\\booktablebox}\n"
+    "\\newcommand{\\bookfittable}[1]{\\sbox{\\booktablebox}{#1}%\n"
+    "  \\ifdim\\wd\\booktablebox>\\linewidth\\resizebox{\\linewidth}{!}{\\usebox{\\booktablebox}}%\n"
+    "  \\else\\usebox{\\booktablebox}\\fi}"
+)
+_TABULAR_RE = re.compile(r"\\(begin|end)\{tabular\}")
+# Already scaled by the model: leave it alone.
+_ALREADY_FITTED_RE = re.compile(r"\\(?:resizebox|scalebox|bookfittable)\b[^\n]{0,40}$|adjustbox\}[^\n]*$")
+
+
+def _blank_comments(text: str) -> str:
+    return re.sub(r"(?<!\\)%[^\n]*", lambda m: " " * len(m.group(0)), text)
+
+
+def fit_wide_tables(text: str) -> tuple[str, int]:
+    """Wrap every outermost ``tabular`` in ``\\bookfittable{...}``.
+
+    Nested tabulars (a cell holding a small table) are inside the outer box
+    already. ``tabular*`` and ``tabularx`` set their own width and are left
+    alone, and so is a ``longtable`` -- a box cannot break across pages.
+    Nothing is added or removed but the wrapper, on the same lines, so error
+    locations (``translated/NNN.tex:L``) stay correct. Returns
+    ``(text, tables_wrapped)``.
+    """
+    scan = _blank_comments(text)
+    pieces: list[str] = []
+    cursor = 0
+    depth = 0
+    start = 0
+    wrapped = 0
+    for match in _TABULAR_RE.finditer(scan):
+        if match.group(1) == "begin":
+            if depth == 0:
+                start = match.start()
+            depth += 1
+            continue
+        if depth == 0:
+            continue  # a stray \end{tabular}: lint reports it
+        depth -= 1
+        if depth:
+            continue
+        end = match.end()
+        if _ALREADY_FITTED_RE.search(scan[max(0, start - 60) : start]):
+            continue
+        pieces.append(text[cursor:start])
+        pieces.append(f"\\{TABLE_FIT_MACRO}{{{text[start:end]}}}")
+        cursor = end
+        wrapped += 1
+    pieces.append(text[cursor:])
+    return "".join(pieces), wrapped
+
+
 # ── Assembly ────────────────────────────────────────────────────────────────
+
+
+_BEGIN_DOCUMENT_RE = re.compile(r"^[ \t]*\\begin\{document\}[^\n]*$", re.MULTILINE)
+
+
+def _insert_after_begin_document(preamble: str, front: str) -> str:
+    """``front`` on the lines after the preamble's (uncommented)
+    ``\\begin{document}``; appended if there is none."""
+    match = _BEGIN_DOCUMENT_RE.search(preamble)
+    if match is None:
+        return f"{preamble}\n{front}"
+    return f"{preamble[: match.end()]}\n{front}{preamble[match.end():]}"
 
 
 def _strip_preamble_leakage(body: str) -> str:
@@ -389,6 +471,7 @@ def assemble_document(
     output_path: Path,
     *,
     preamble_path: Path | None = None,
+    cover: str = "",
 ) -> Path:
     """Wrap ``body_parts`` in the asset preamble and write a compilable .tex.
 
@@ -396,16 +479,26 @@ def assemble_document(
     ``\\frontmatter``, ``\\tableofcontents``, ``\\mainmatter`` and the chapter
     counter, so only ``\\end{document}`` is added after the body.
 
+    Right after ``\\begin{document}`` go the table-fitting macro (when a
+    table needs it, see `fit_wide_tables`) and ``cover`` -- the title page
+    from `src.cover`, before the table of contents.
+
     The file must be written next to ``images/``: the preamble's
     ``\\graphicspath`` looks for figures there, relative to the .tex.
     """
     bodies = [
         cleaned for cleaned in (_strip_preamble_leakage(part) for part in body_parts) if cleaned
     ]
+    body, tables = fit_wide_tables("\n\n".join(bodies))
+    if tables:
+        logger.info("Wrapped %d table(s) to fit the text width", tables)
 
-    document = "\n\n".join(
-        [load_preamble(preamble_path).rstrip("\n"), "\n\n".join(bodies), "\\end{document}", ""]
-    )
+    front = "\n".join(part for part in (TABLE_FIT_SUPPORT if tables else "", cover) if part)
+    preamble = load_preamble(preamble_path).rstrip("\n")
+    if front:
+        preamble = _insert_after_begin_document(preamble, front)
+
+    document = "\n\n".join([preamble, body, "\\end{document}", ""])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(document, encoding="utf-8")
@@ -422,7 +515,9 @@ __all__ = [
     "EnvIssue",
     "assemble_document",
     "brace_imbalance",
+    "TABLE_FIT_MACRO",
     "build_system_prompt",
+    "fit_wide_tables",
     "find_preamble_leakage",
     "load_preamble",
     "preamble_for",

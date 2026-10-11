@@ -16,6 +16,10 @@ perfect LaTeX document that still contains Chinese is a FAILED answer.
   image tokens.
 - Never leave a \begin{...} unclosed, and never split an environment across the end of
   your output.
+- End your reply with this exact line, on its own, after everything else:
+  % END-OF-CHUNK
+  It is how a cut-off reply is detected. Write it once, at the very end, and only when
+  the whole excerpt has been translated.
 
 ## Structure
 
@@ -164,3 +168,6 @@ as you can and keep the column count consistent — do not invent data to fill g
 
 Do not summarise, shorten, merge or omit anything. Translate every line. If a short
 span is already in English (an equation label, a proper noun, a citation), leave it.
+
+The last line of your reply is always:
+% END-OF-CHUNK

@@ -179,6 +179,25 @@ def log_excerpt(log_path: Path) -> str:
     return "\n".join(matches[:_MAX_ERROR_LINES])
 
 
+@dataclass(frozen=True)
+class BuildResult:
+    """A build's outcome, with every located error when it failed."""
+
+    succeeded: bool
+    message: str
+    errors: tuple[LatexError, ...] = ()
+
+    def to_json(self) -> dict:
+        return {
+            "succeeded": self.succeeded,
+            "message": self.message,
+            "errors": [
+                {"location": e.location, "message": e.message, "context": e.context}
+                for e in self.errors
+            ],
+        }
+
+
 def build_pdf(
     tex_path: Path,
     *,
@@ -187,6 +206,25 @@ def build_pdf(
     timeout_seconds: int = BUILD_TIMEOUT_SECONDS,
     collect_all_errors: bool = True,
 ) -> tuple[bool, str]:
+    """Compile ``tex_path``; ``(succeeded, message)``. See `compile_pdf`."""
+    result = compile_pdf(
+        tex_path,
+        engine=engine,
+        passes=passes,
+        timeout_seconds=timeout_seconds,
+        collect_all_errors=collect_all_errors,
+    )
+    return result.succeeded, result.message
+
+
+def compile_pdf(
+    tex_path: Path,
+    *,
+    engine: str = DEFAULT_ENGINE,
+    passes: int = 2,
+    timeout_seconds: int = BUILD_TIMEOUT_SECONDS,
+    collect_all_errors: bool = True,
+) -> BuildResult:
     """Compile ``tex_path`` to a PDF beside it.
 
     Runs in the ``.tex`` file's own directory so the preamble's
@@ -195,14 +233,14 @@ def build_pdf(
     than the first (see ``collect_errors``).
 
     Returns:
-        ``(succeeded, message)``. A missing engine, a missing source file, a
-        timeout and a LaTeX error all come back as ``(False, <explanation>)``
-        rather than raising -- see the module docstring.
+        A `BuildResult`. A missing engine, a missing source file, a timeout
+        and a LaTeX error all come back as a failed result rather than
+        raising -- see the module docstring.
     """
     if not tex_path.exists():
-        return False, f"LaTeX source not found: {tex_path}"
+        return BuildResult(False, f"LaTeX source not found: {tex_path}")
     if shutil.which(engine) is None:
-        return (
+        return BuildResult(
             False,
             f"LaTeX engine {engine!r} is not on PATH. Install TeX Live or MiKTeX "
             f"(and make sure {engine} is on PATH), or pass a different engine.",
@@ -231,13 +269,13 @@ def build_pdf(
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
-            return (
+            return BuildResult(
                 False,
                 f"{engine} timed out after {timeout_seconds // 60} minutes on pass "
                 f"{attempt}/{passes}.",
             )
         except OSError as exc:
-            return False, f"Could not run {engine}: {exc}"
+            return BuildResult(False, f"Could not run {engine}: {exc}")
 
         if result.returncode != 0:
             failed = f"{engine} failed on pass {attempt}/{passes} (exit {result.returncode})"
@@ -247,26 +285,34 @@ def build_pdf(
                 else []
             )
             if not errors:
-                return False, f"{failed}:\n{log_excerpt(log_path)}"
+                return BuildResult(False, f"{failed}:\n{log_excerpt(log_path)}")
             shown = "\n".join(error.render() for error in errors[:_MAX_ERRORS])
             more = (
                 f"\n  ... and {len(errors) - _MAX_ERRORS} more" if len(errors) > _MAX_ERRORS else ""
             )
-            return (
+            return BuildResult(
                 False,
                 f"{failed}. Every error in the book, from one run without "
                 f"-halt-on-error ({len(errors)}):\n{shown}{more}",
+                tuple(errors),
             )
 
     pdf_path = tex_path.with_suffix(".pdf")
     if not pdf_path.exists():
-        return (
+        return BuildResult(
             False,
             f"{engine} reported success but no PDF was produced:\n{log_excerpt(log_path)}",
         )
 
     logger.info("Wrote %s", pdf_path)
-    return True, f"PDF written to {pdf_path}"
+    return BuildResult(True, f"PDF written to {pdf_path}")
 
 
-__all__ = ["BUILD_TIMEOUT_SECONDS", "DEFAULT_ENGINE", "build_pdf", "log_excerpt"]
+__all__ = [
+    "BUILD_TIMEOUT_SECONDS",
+    "DEFAULT_ENGINE",
+    "BuildResult",
+    "build_pdf",
+    "compile_pdf",
+    "log_excerpt",
+]

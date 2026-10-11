@@ -349,3 +349,26 @@ def _load_manifest(manifest_path: Path) -> SplitResult | None:
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         logger.warning("Could not parse existing manifest %s: %s", manifest_path, exc)
         return None
+
+
+def extract_pages(pdf_path: Path, start: int, end: int, out_path: Path) -> Path:
+    """Write pages ``start..end`` (1-based, inclusive) of ``pdf_path`` to
+    ``out_path`` -- the page-range trim before parsing (`src.page_range`)."""
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"Input PDF not found: {pdf_path}")
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception as exc:  # noqa: BLE001 - re-raised with context
+        raise RuntimeError(f"Failed to open PDF '{pdf_path}': {exc}") from exc
+    try:
+        if not 1 <= start <= end <= doc.page_count:
+            raise ValueError(
+                f"page range {start}-{end} is outside '{pdf_path.name}' (1-{doc.page_count})"
+            )
+        data = _render_pages(doc, start, end)
+    finally:
+        doc.close()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(data)
+    logger.info("Wrote pages %d-%d of '%s' to %s", start, end, pdf_path.name, out_path)
+    return out_path

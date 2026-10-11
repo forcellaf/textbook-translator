@@ -51,6 +51,7 @@ from pathlib import Path
 
 from src.build import chunk_marker
 from src.config import KIT_CHUNK_CHARS
+from src.cover import cover_latex, find_book_meta, load_book_meta
 from src.figures import DEFAULT_WIDTH, FIGURES_NAME, FigureRecord, load_figures
 from src.latex import assemble_document, build_system_prompt, preamble_for
 from src.lint import (
@@ -58,6 +59,7 @@ from src.lint import (
     TRANSLATED_SUFFIX,
     _braced_argument,
     latex_image_refs,
+    strip_sentinel,
     strip_wrapping_fence,
 )
 from src.profiler import BookProfile
@@ -288,7 +290,8 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
             problems.append(f"chunk {source_path.stem} has no translation saved")
             continue
         raw = target_path.read_text(encoding="utf-8")
-        body = strip_wrapping_fence(raw).strip()
+        # The `% END-OF-CHUNK` sentinel has done its job once lint has seen it.
+        body = strip_sentinel(strip_wrapping_fence(raw)).strip()
         # A comment naming the fragment and the line its body starts on, so
         # an error at line 6,532 of the assembled book can be reported as
         # translated/008.tex:39 -- see `src.build.collect_errors`.
@@ -318,8 +321,17 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
                 "argument and stayed as text"
             )
 
+    # The cover page, from book_meta.json. Its absence is reported, never
+    # a problem: problems gate the build, and a missing cover is cosmetic.
+    meta, notes = load_book_meta(find_book_meta(kit_dir))
+    for note in notes:
+        logger.warning("Cover: %s", note)
+
     out_path = assemble_document(
-        [merged], kit_dir / ASSEMBLED_NAME, preamble_path=preamble_for(kit_dir)
+        [merged],
+        kit_dir / ASSEMBLED_NAME,
+        preamble_path=preamble_for(kit_dir),
+        cover=cover_latex(meta) if meta else "",
     )
     logger.info("Assembled %s (%d chars of translated body)", out_path, len(merged))
     return out_path, problems

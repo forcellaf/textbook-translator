@@ -1,5 +1,5 @@
 """
-Standalone smoke test against the REAL LLM API.
+Standalone smoke test against the REAL Claude API (API mode only).
 
 Everything under ``tests/`` uses fakes and never touches the network, which
 is right for a test suite and useless for answering "is my key working?".
@@ -19,6 +19,7 @@ that silent degradation is exactly the thing you are trying to detect.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -66,91 +67,56 @@ def _has_cjk(text: str) -> bool:
     return any("一" <= char <= "鿿" for char in text)
 
 
-# ── Provider-specific remediation ───────────────────────────────────────────
-# Stages 1-2 are the ones that fail because of credentials, so their hints name
-# the env vars and the console of whichever provider is actually configured.
-
-_PROVIDER_HINTS = {
-    "deepseek": {
-        "key": "DEEPSEEK_API_KEY",
-        "model": "DEEPSEEK_MODEL",
-        "console": "https://platform.deepseek.com/api_keys",
-        "fatal": (
-            "This failure is not retryable. Check that DEEPSEEK_API_KEY is valid "
-            "(https://platform.deepseek.com/api_keys), that the account still has credit "
-            "(https://platform.deepseek.com/top_up -- a 402 means the balance is empty), "
-            "and that DEEPSEEK_MODEL names a model your key can access."
-        ),
-    },
-    "gemini": {
-        "key": "GEMINI_API_KEY",
-        "model": "GEMINI_MODEL",
-        "console": "https://aistudio.google.com/apikey",
-        "fatal": (
-            "This failure is not retryable. Check that GEMINI_API_KEY is valid and not "
-            "expired (https://aistudio.google.com/apikey) and that GEMINI_MODEL names a "
-            "model your key can access."
-        ),
-    },
-}
-
-_UNKNOWN_PROVIDER_HINT = {
-    "key": "<PROVIDER>_API_KEY",
-    "model": "<PROVIDER>_MODEL",
-    "console": "your provider's console",
-    "fatal": "This failure is not retryable; check the provider's credentials and model name.",
-}
-
-
-def _hints(provider: str) -> dict[str, str]:
-    return _PROVIDER_HINTS.get(provider, _UNKNOWN_PROVIDER_HINT)
-
-
-def _active_model(config: object) -> str:
-    """The model constant belonging to the active provider."""
-    provider = getattr(config, "LLM_PROVIDER", "")
-    return str(getattr(config, f"{provider.upper()}_MODEL", "<unknown>"))
+_FATAL_HINT = (
+    "This failure is not retryable. Check that ANTHROPIC_API_KEY is valid "
+    "(https://platform.claude.com/settings/keys), that the account has credit, and that "
+    "CLAUDE_MODEL_<ROLE> names a model the key can use."
+)
 
 
 # ── Stages ──────────────────────────────────────────────────────────────────
 
 
-def stage_1_config() -> object:
-    """Config loads, credentials are present, a provider can be constructed."""
+def stage_1_config() -> dict[str, object]:
+    """Config loads, a key is present, a provider per role can be built.
+
+    Forces ``LLM_BACKEND=anthropic``: this script exists to test the API, and
+    with no key the pipeline would quietly pick the exchange instead.
+    """
+    os.environ["LLM_BACKEND"] = "anthropic"
     try:
         from src import config
         from src.llm.factory import get_llm
-    except ValueError as exc:  # config.py raises this for a missing key
-        raise StageFailure(
-            f"Configuration failed to load: {exc}",
-            "Copy .env.example to .env in the project root and set the API key named above "
-            "-- only the key for the provider in LLM_PROVIDER is required.",
-        ) from exc
     except ImportError as exc:
         raise StageFailure(
             f"Could not import the project: {exc}",
             "Install dependencies with `uv sync` and run from the project root.",
         ) from exc
 
-    try:
-        llm = get_llm()
-    except Exception as exc:  # noqa: BLE001 - report, don't traceback
+    if not config.ANTHROPIC_API_KEY:
         raise StageFailure(
-            f"Could not construct the LLM provider: {exc}",
-            f"Check LLM_PROVIDER (currently {config.LLM_PROVIDER!r}) in your .env.",
-        ) from exc
+            "ANTHROPIC_API_KEY is not set.",
+            "API mode needs a key in .env. Without one, run in no-API mode instead "
+            "(Claude Code, /translate-book) -- nothing in this script applies there.",
+        )
 
-    print(f"    provider={config.LLM_PROVIDER} model={_active_model(config)}")
+    llms: dict[str, object] = {}
+    for role in (config.ROLE_PROFILE, config.ROLE_TRANSLATE):
+        try:
+            llms[role] = get_llm(role)
+        except Exception as exc:  # noqa: BLE001 - report, don't traceback
+            raise StageFailure(
+                f"Could not construct the {role} provider: {exc}",
+                "Check CLAUDE_MODEL_<ROLE> / CLAUDE_EFFORT_<ROLE> in your .env.",
+            ) from exc
+        cfg = config.role_config(role)
+        print(f"    {role}: model={cfg.model} effort={cfg.effort} max_tokens={cfg.max_tokens}")
     print(f"    source_lang={config.SOURCE_LANG} target_lang={config.TARGET_LANG}")
-    return llm
+    return llms
 
 
 def stage_2_raw_call(llm: object) -> None:
     """One raw generate() call -- the cheapest possible proof the key works."""
-    from src import config
-
-    hints = _hints(config.LLM_PROVIDER)
-
     try:
         reply = llm.generate(  # type: ignore[attr-defined]
             "You are a translation assistant. Reply with the requested text and nothing else.",
@@ -162,19 +128,19 @@ def stage_2_raw_call(llm: object) -> None:
         # it still means the one call this script makes did not come back.
         raise StageFailure(
             f"The API call failed: {exc}",
-            f"Check that {hints['key']} is valid ({hints['console']}), that {hints['model']} "
-            "names a model your key can access, and that the network (or HTTPS_PROXY) can "
-            "reach the API.",
+            "Check that ANTHROPIC_API_KEY is valid, that CLAUDE_MODEL_TRANSLATE names a "
+            "model your key can access, and that the network (or HTTPS_PROXY) can reach "
+            "the API.",
         ) from exc
     except ValueError as exc:
         # Providers raise non-RuntimeError for failures no amount of retrying
         # fixes -- a bad key, an empty balance, a rejected request.
-        raise StageFailure(f"The API call failed permanently: {exc}", hints["fatal"]) from exc
+        raise StageFailure(f"The API call failed permanently: {exc}", _FATAL_HINT) from exc
 
     if not reply.strip():
         raise StageFailure(
             "The API returned an empty response.",
-            f"Try a different {hints['model']}; the current one may be refusing or "
+            "Try a different CLAUDE_MODEL_TRANSLATE; the current one may be refusing or "
             "rate-limiting.",
         )
     print(f"    response: {reply.strip()[:80]}")
@@ -268,7 +234,7 @@ def stage_4_latex(llm: object, profile: object) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="python scripts/test_api.py",
-        description="Smoke-test the real LLM API, one layer at a time.",
+        description="Smoke-test the real Claude API, one layer at a time.",
     )
     parser.add_argument(
         "--quick",
@@ -307,11 +273,11 @@ def main() -> int:
         args.work_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[3/{total}] Book profiling...")
-        profile = stage_3_profile(llm, args.work_dir)
+        profile = stage_3_profile(llms["profile"], args.work_dir)
         print("  OK\n")
 
         print(f"[4/{total}] LaTeX translation...")
-        stage_4_latex(llm, profile)
+        stage_4_latex(llms["translate"], profile)
         print("  OK\n")
 
     except StageFailure as failure:

@@ -5,7 +5,7 @@ numbered chapters, so the PDF printed "Chapter 24" over chapter 22. The
 parser had dropped 第N章 from most titles, so the text of a heading cannot
 settle it -- the numbering under it, compared across siblings, can.
 
-DeepSeek labels the outline; code only cross-checks. No test here makes a
+Claude labels the outline; code only cross-checks. No test here makes a
 real API call.
 """
 
@@ -111,7 +111,7 @@ def test_caption_evidence_does_not_depend_on_the_caption_word() -> None:
     assert find_divisions(text)[0].evidence["12"] == 2
 
 
-# ── DeepSeek labels the whole outline in one call ───────────────────────────
+# ── Claude labels the whole outline in one call ─────────────────────────────
 
 
 def test_one_call_sees_every_row_and_labels_the_book() -> None:

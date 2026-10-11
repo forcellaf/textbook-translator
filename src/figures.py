@@ -26,8 +26,9 @@ reliably; assembly (``src.kit``) applies these records at build time. So a
 wrong width, number or drop is fixed by editing one JSON line and
 rebuilding, and translations made before this module existed stay valid.
 
-Records with ``"by": "manual"`` are never overwritten -- the same convention
-as ``structure.json``.
+Records with ``"by": "manual"`` (a person) or ``"by": "agent"`` (the
+unattended orchestrator) are never overwritten -- the same convention as
+``structure.json``; see `src.provenance`.
 
 MinerU's layout data (``content_list.json``)
 --------------------------------------------
@@ -75,7 +76,9 @@ from src.config import (
     VISION_MIN_INTERVAL_SECONDS,
 )
 from src.llm.base import VisionLLM, image_mime_type
+from src.llm.exchange import ExchangePending
 from src.profiler import extract_json_object
+from src.provenance import AGENT, is_protected
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,7 @@ BY_CAPTION = "caption"
 BY_CLASSIFIER = "classifier"
 BY_DEFAULT = "default"
 BY_MANUAL = "manual"
+BY_AGENT = AGENT
 
 FIGURE = "figure"
 DECORATION = "decoration"
@@ -114,6 +118,8 @@ FLAG_MALFORMED = "malformed-reply"
 FLAG_ERROR = "classifier-error"
 FLAG_UNCLASSIFIED = "unclassified"
 FLAG_WOULD_DROP = "would-drop"
+# No-API mode: the classifier's answer is an exchange request not answered yet.
+FLAG_PENDING = "exchange-pending"
 
 MODE_CLASSIFY = "classify"
 MODE_DRY_RUN = "dry-run"
@@ -629,6 +635,9 @@ def classify_image(vision: VisionLLM, image: bytes, site: ImageSite) -> Verdict:
         )
     except ValueError as exc:
         raise FatalClassifierError(str(exc)) from exc
+    except ExchangePending:
+        # Kept, like every unanswered image; the answer arrives next round.
+        return Verdict(None, None, "awaiting an exchange answer", FLAG_PENDING)
     except Exception as exc:  # noqa: BLE001 - fail open on anything else
         return Verdict(None, None, f"API failure: {exc}"[:300], FLAG_ERROR)
     return parse_verdict(raw)
@@ -682,7 +691,7 @@ def decide(
     label, confidence = record.label, record.confidence
 
     if mode == MODE_OFF or label is None:
-        if not any(f in record.flags for f in (FLAG_MALFORMED, FLAG_ERROR)):
+        if not any(f in record.flags for f in (FLAG_MALFORMED, FLAG_ERROR, FLAG_PENDING)):
             record.flags.append(FLAG_UNCLASSIFIED)
         return
     if label == FIGURE:
@@ -708,6 +717,7 @@ class FiguresReport:
     mode: str
     calls: int = 0
     stopped: str | None = None  # why classification stopped early
+    pending: int = 0  # exchange requests awaiting an answer
 
     def _ordered(self) -> list[tuple[str, FigureRecord]]:
         return [(name, self.records[name]) for name in self.order if name in self.records]
@@ -718,7 +728,8 @@ class FiguresReport:
 
     @property
     def flagged(self) -> list[str]:
-        return [n for n, r in self._ordered() if r.keep and r.flags]
+        # A decided (manual or agent) record is no longer waiting for anyone.
+        return [n for n, r in self._ordered() if r.keep and r.flags and not is_protected(r.by)]
 
     @property
     def defaulted(self) -> list[str]:
@@ -733,7 +744,7 @@ class FiguresReport:
         return Counter(
             r.label or "none"
             for _, r in self._ordered()
-            if not r.number and not r.panel_of and r.by != BY_MANUAL
+            if not r.number and not r.panel_of and not is_protected(r.by)
         )
 
     def render(self) -> str:
@@ -745,6 +756,8 @@ class FiguresReport:
             f"{len(self.dropped)} dropped, {len(self.flagged)} flagged for review; "
             f"by {dict(sorted(by.items()))}; {self.calls} vision call(s)"
         ]
+        if self.pending:
+            lines.append(f"  {self.pending} image(s) awaiting an exchange answer (kept for now)")
         if self.stopped:
             lines.append(f"  classification stopped early: {self.stopped}")
         if self.mode != MODE_OFF:
@@ -809,7 +822,8 @@ def build_figures(
     records: dict[str, FigureRecord] = {}
     numbers: dict[str, str | None] = {}
 
-    manual = {name: r for name, r in existing.items() if r.by == BY_MANUAL}
+    # Manual and agent records are kept verbatim (manual and agent alike).
+    manual = {name: r for name, r in existing.items() if is_protected(r.by)}
 
     # Pass 1: numbers and widths, which need no model.
     for site in sites:
@@ -843,8 +857,10 @@ def build_figures(
 
     in_gap = numbering_gaps(sites, numbers)
 
-    # Pass 2: classify what is left, reusing cached labels.
+    # Pass 2: classify what is left, reusing cached labels. On the exchange
+    # backend every unanswered image becomes a request in this one pass.
     calls = 0
+    pending = 0
     stopped: str | None = None
     last_call = 0.0
     for site in sites:
@@ -873,10 +889,13 @@ def build_figures(
                     logger.error("Vision classification stopped: %s", exc)
                     verdict = Verdict(None, None, f"not classified: {exc}"[:300], FLAG_ERROR)
                 else:
-                    calls += 1
-                    last_call = time.monotonic()
-                    if calls % 25 == 0:
-                        logger.info("Classified %d image(s)", calls)
+                    if verdict.flag == FLAG_PENDING:
+                        pending += 1
+                    else:
+                        calls += 1
+                        last_call = time.monotonic()
+                        if calls % 25 == 0:
+                            logger.info("Classified %d image(s)", calls)
             record.label, record.confidence, record.reason = (
                 verdict.label,
                 verdict.confidence,
@@ -894,7 +913,7 @@ def build_figures(
     ordered = [s.name for s in sites]
     order = ordered + [n for n in records if n not in set(ordered)]
     records = {name: records[name] for name in order}
-    return FiguresReport(records, order, mode, calls, stopped)
+    return FiguresReport(records, order, mode, calls, stopped, pending)
 
 
 def figures_step(
@@ -912,7 +931,7 @@ def figures_step(
         from src.llm.factory import get_vision_llm
 
         try:
-            vision = get_vision_llm()
+            vision = get_vision_llm(work_dir=work_dir)
         except Exception as exc:  # noqa: BLE001 - fail open: keep everything
             note = f"no vision model available ({exc}); uncaptioned images are kept"
 
@@ -1114,7 +1133,7 @@ def apply_linked_widths(records: dict[str, FigureRecord], entries: list[dict]) -
     by_name = image_entries(entries)
     measured = 0
     for name, record in records.items():
-        if record.by == BY_MANUAL:
+        if is_protected(record.by):
             continue
         width = width_for(by_name.get(name), reference)
         record.flags = [f for f in record.flags if f != FLAG_NO_BBOX]
@@ -1193,7 +1212,8 @@ def write_review(
         f"<h1>Figure review &mdash; {counts}</h1>\n"
         "<p>Red: dropped. Yellow: kept, needs a look. Blue: kept with a default "
         f"width. To overrule a decision, edit the image's entry in {FIGURES_NAME}, "
-        'set <code>"by": "manual"</code>, and rebuild.</p>\n'
+        'set <code>"by": "manual"</code> (or <code>"agent"</code> for the orchestrator), '
+        "and rebuild.</p>\n"
         "<table><tr><th>image</th><th>file / token</th><th>decision</th><th>number</th>"
         "<th>label</th><th>reason</th><th>flags</th><th>by</th></tr>\n"
         f"{body}\n</table></body></html>\n"
@@ -1208,6 +1228,7 @@ __all__ = [
     "BY_CAPTION",
     "BY_CLASSIFIER",
     "BY_DEFAULT",
+    "BY_AGENT",
     "BY_MANUAL",
     "CONTENT_LIST_NAME",
     "FIGURES_NAME",

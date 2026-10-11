@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run python scripts/*)",
+      "Bash(uv run python -m pytest *)",
+      "Bash(uv sync *)",
+      "Bash(pdflatex *)",
+      "Bash(ls *)",
+      "Bash(cp *)",
+      "Bash(mkdir *)",
+      "Read(/data/**)",
+      "Edit(/data/**)",
+      "Read(/.claude/**)"
+    ]
+  }
+}

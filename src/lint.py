@@ -44,12 +44,12 @@ import json
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 
 from src.config import SOURCE_RESIDUE_THRESHOLD
 from src.figures import FIGURES_NAME, load_figures, split_number
+from src.findings import Finding, LintReport, Severity
+from dataclasses import dataclass, replace
 from src.latex import (
     DEFINED_ENVIRONMENTS,
     brace_imbalance,
@@ -68,64 +68,6 @@ from src.normalize import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class Severity(str, Enum):
-    """How a finding should be acted on."""
-
-    AUTO_FIX = "auto-fix"  # provably safe; `apply_auto_fixes` handles it
-    REVIEW = "review"  # a human must look; gates the build
-    INFO = "info"  # context, not a problem
-
-
-@dataclass(frozen=True)
-class Finding:
-    check: str
-    severity: Severity
-    message: str
-    line: int = 0  # 1-based markdown line, 0 when not line-specific
-    context: str = ""
-
-    def render(self) -> str:
-        where = f"L{self.line}" if self.line else "-"
-        tail = f"\n        {self.context}" if self.context else ""
-        return f"  [{self.severity.value:>8}] {where:>8}  {self.check}: {self.message}{tail}"
-
-
-@dataclass
-class LintReport:
-    findings: list[Finding] = field(default_factory=list)
-
-    def of(self, severity: Severity) -> list[Finding]:
-        return [f for f in self.findings if f.severity is severity]
-
-    @property
-    def needs_review(self) -> bool:
-        return any(f.severity is Severity.REVIEW for f in self.findings)
-
-    @property
-    def exit_code(self) -> int:
-        """Non-zero when anything needs review, so this can gate the build."""
-        return 1 if self.needs_review else 0
-
-    def render(self) -> str:
-        lines: list[str] = []
-        for severity in (Severity.REVIEW, Severity.AUTO_FIX, Severity.INFO):
-            group = self.of(severity)
-            if not group:
-                continue
-            lines.append(f"\n{severity.value.upper()} ({len(group)}):")
-            lines.extend(f.render() for f in group)
-
-        review = len(self.of(Severity.REVIEW))
-        auto = len(self.of(Severity.AUTO_FIX))
-        lines.append(
-            f"\n{review} finding(s) need review, {auto} auto-fixable, "
-            f"{len(self.of(Severity.INFO))} informational."
-        )
-        if not review:
-            lines.append("Nothing blocking; the build can go ahead.")
-        return "\n".join(lines)
 
 
 # ── Command vocabulary ──────────────────────────────────────────────────────
@@ -1196,15 +1138,20 @@ def _check_latex_dangling_commands(text: str) -> list[Finding]:
     return findings[:_MAX_EXAMPLES]
 
 
-def _check_latex_unknown_commands(text: str) -> list[Finding]:
+def _check_latex_unknown_commands(
+    text: str, known: frozenset[str] = KNOWN_COMMANDS
+) -> list[Finding]:
     """Report-only, for the reason in the module docstring: 40 of the 41
-    tokens this flagged on the test book were legitimate."""
+    tokens this flagged on the test book were legitimate.
+
+    ``known`` is ``KNOWN_COMMANDS`` plus the book's own allowlist,
+    ``kit/known_commands.txt`` (see `load_known_commands`)."""
     seen: dict[str, tuple[int, str]] = {}
     counts: dict[str, int] = {}
     for span in iter_latex_math_spans(text):
         for match in _COMMAND_RE.finditer(span.body):
             name = match.group(1)
-            if name in KNOWN_COMMANDS or _is_doubled_command(name):
+            if name in known or _is_doubled_command(name):
                 # A doubled command (\mathrmmathrm) is unknown by definition,
                 # but `_check_doubled_commands` already owns it and can repair
                 # it. Reporting it here too would gate the build on a defect
@@ -1222,8 +1169,9 @@ def _check_latex_unknown_commands(text: str) -> list[Finding]:
         Finding(
             "unknown-command",
             Severity.REVIEW,
-            f"\\{name} appears {count}x in math and is not in KNOWN_COMMANDS -- "
-            "check it is real LaTeX, then add it to the list",
+            f"\\{name} appears {count}x in math and is not a known command -- if it is "
+            f"real LaTeX the preamble provides, add it to the book's {KNOWN_COMMANDS_NAME} "
+            "with a comment; otherwise fix the text",
             seen[name][0],
             seen[name][1],
         )
@@ -1462,7 +1410,11 @@ def _resolves(ref: str, base_dir: Path) -> bool:
 
 
 def lint_latex(
-    text: str, *, base_dir: Path | None = None, preamble: str | None = None
+    text: str,
+    *,
+    base_dir: Path | None = None,
+    preamble: str | None = None,
+    extra_commands: frozenset[str] = frozenset(),
 ) -> LintReport:
     """Run every check that applies to translated LaTeX body text.
 
@@ -1477,6 +1429,8 @@ def lint_latex(
             the checks that depend on it (loaded packages, the starting
             chapter number) -- right for a lone fragment, which is neither a
             whole book nor necessarily headed for this preamble.
+        extra_commands: The book's own allowlist (``kit/known_commands.txt``),
+            merged into ``KNOWN_COMMANDS`` for this lint only.
     """
     findings: list[Finding] = []
     findings += _check_environments(text)
@@ -1491,7 +1445,7 @@ def lint_latex(
     findings += _check_markdown_headings(text)
     findings += _check_latex_dangling_commands(text)
     findings += _check_doubled_commands(text)
-    findings += _check_latex_unknown_commands(text)
+    findings += _check_latex_unknown_commands(text, KNOWN_COMMANDS | extra_commands)
     findings += _check_text_commands_in_math(text)
     findings += _check_required_packages(text, preamble)
     findings += _check_chapter_numbering(text, preamble)
@@ -1616,10 +1570,17 @@ def strip_duplicated_numbers(text: str) -> tuple[str, int]:
 # ── Translation-kit checks ──────────────────────────────────────────────────
 
 
-def lint_chunk_pair(name: str, source: str, translation: str) -> list[Finding]:
+def lint_chunk_pair(
+    name: str,
+    source: str,
+    translation: str,
+    *,
+    require_sentinel: bool = False,
+    file: str = "",
+) -> list[Finding]:
     """Compare one source chunk against its translation.
 
-    Three independent failures, none of which the others catch:
+    Four independent failures, none of which the others catch:
 
     * **Untranslated.** A passed-through chunk is *full length* and perfectly
       formatted, so only the source-script density gives it away.
@@ -1627,8 +1588,25 @@ def lint_chunk_pair(name: str, source: str, translation: str) -> list[Finding]:
       only the length ratio finds it.
     * **Image tokens.** A dropped or invented ``IMG_nnnn`` becomes a missing
       figure at build time with no earlier warning.
+    * **No sentinel.** With ``require_sentinel`` (a kit whose system prompt
+      asks for it), a reply that does not end with ``% END-OF-CHUNK`` was cut
+      off. In no-API mode the model's stop reason is invisible, so this is
+      the deterministic truncation check; the length checks above are the
+      statistical one.
+
+    ``file`` labels the findings (``translated/012.tex``).
     """
     findings: list[Finding] = []
+
+    if require_sentinel and not has_sentinel(translation):
+        findings.append(
+            Finding(
+                "truncated-sentinel",
+                Severity.REVIEW,
+                f"chunk {name} does not end with the line {SENTINEL} -- the reply was "
+                "probably cut off; re-translate it",
+            )
+        )
 
     ratio = cjk_ratio(translation)
     if ratio > SOURCE_RESIDUE_THRESHOLD:
@@ -1675,7 +1653,168 @@ def lint_chunk_pair(name: str, source: str, translation: str) -> list[Finding]:
             )
         )
 
-    return findings
+    return [replace(f, file=file) for f in findings] if file else findings
+
+
+# ── The truncation sentinel ─────────────────────────────────────────────────
+#
+# The translating model is told (assets/system_prompt_latex.txt, and the
+# chunk-translator agent) to end every reply with this line. A reply that
+# lacks it was cut off. Assembly strips it; it is a LaTeX comment anyway.
+
+SENTINEL = "% END-OF-CHUNK"
+_SENTINEL_LINE_RE = re.compile(r"^[ \t]*% END-OF-CHUNK[ \t]*$\n?", re.MULTILINE)
+
+
+def has_sentinel(text: str) -> bool:
+    """Whether the last non-blank line of ``text`` is the sentinel."""
+    lines = [line for line in text.strip().split("\n") if line.strip()]
+    return bool(lines) and lines[-1].strip() == SENTINEL
+
+
+def strip_sentinel(text: str) -> str:
+    """``text`` without any sentinel line."""
+    return _SENTINEL_LINE_RE.sub("", text)
+
+
+def kit_requires_sentinel(kit_dir: Path) -> bool:
+    """A kit asks for the sentinel when its system prompt does. Kits built
+    before the sentinel existed are not held to it."""
+    prompt = kit_dir / "system_prompt.txt"
+    try:
+        return SENTINEL in prompt.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+# ── Per-book additions: known commands and waivers ──────────────────────────
+
+KNOWN_COMMANDS_NAME = "known_commands.txt"
+WAIVERS_NAME = "lint_waivers.json"
+
+
+def load_known_commands(kit_dir: Path) -> frozenset[str]:
+    """``kit/known_commands.txt``: one command per line, ``#`` starts a
+    comment (say why the command is real). Merged into ``KNOWN_COMMANDS`` at
+    lint time, so a book's legitimate vocabulary never requires editing this
+    module -- which an unattended run must not do."""
+    path = kit_dir / KNOWN_COMMANDS_NAME
+    if not path.exists():
+        return frozenset()
+    names: set[str] = set()
+    for line in path.read_text(encoding="utf-8").split("\n"):
+        entry = line.split("#", 1)[0].strip().lstrip("\\")
+        if re.fullmatch(r"[A-Za-z]+", entry):
+            names.add(entry)
+    return frozenset(names)
+
+
+@dataclass(frozen=True)
+class Waiver:
+    check: str
+    file: str
+    line_excerpt: str
+    reason: str
+    by: str
+
+    def matches(self, finding: Finding) -> bool:
+        if self.check not in ("*", finding.check):
+            return False
+        if self.file and self.file != "*" and not (
+            finding.file == self.file or finding.file.endswith("/" + self.file)
+        ):
+            return False
+        if not self.line_excerpt:
+            return True
+        haystack = _collapse_space(f"{finding.message} {finding.context}")
+        return _collapse_space(self.line_excerpt) in haystack
+
+
+def _collapse_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def load_waivers(kit_dir: Path) -> tuple[list[Waiver], list[Finding]]:
+    """``kit/lint_waivers.json``: a list of ``{check, file, line_excerpt,
+    reason, by}``. Returns the usable waivers and findings about unusable
+    ones -- a waiver without a reason is refused, because a waived finding
+    must always say why it is not a defect."""
+    path = kit_dir / WAIVERS_NAME
+    if not path.exists():
+        return [], []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], [Finding("waivers", Severity.REVIEW, f"{path} is unreadable: {exc}")]
+    entries = data.get("waivers", data) if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return [], [Finding("waivers", Severity.REVIEW, f"{path} must hold a list of waivers")]
+    waivers: list[Waiver] = []
+    problems: list[Finding] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not str(entry.get("check", "")).strip():
+            problems.append(
+                Finding("waivers", Severity.REVIEW, f"waiver {index} has no check: {entry!r}")
+            )
+            continue
+        reason = str(entry.get("reason", "")).strip()
+        if not reason:
+            problems.append(
+                Finding(
+                    "waivers",
+                    Severity.REVIEW,
+                    f"waiver {index} ({entry.get('check')}) has no reason and was ignored",
+                )
+            )
+            continue
+        waivers.append(
+            Waiver(
+                check=str(entry["check"]).strip(),
+                file=str(entry.get("file", "") or "").strip(),
+                line_excerpt=str(entry.get("line_excerpt", "") or ""),
+                reason=reason,
+                by=str(entry.get("by", "") or "unknown").strip(),
+            )
+        )
+    return waivers, problems
+
+
+def apply_waivers(findings: list[Finding], waivers: list[Waiver]) -> list[Finding]:
+    """Downgrade every finding a waiver matches to info, reason attached, so
+    a waived finding stays visible. Applies to every check. A waiver that
+    matched nothing is reported (info), so stale waivers get noticed."""
+    if not waivers:
+        return findings
+    used: set[int] = set()
+    out: list[Finding] = []
+    for finding in findings:
+        hit = next(
+            (i for i, w in enumerate(waivers) if finding.severity is not Severity.INFO and w.matches(finding)),
+            None,
+        )
+        if hit is None:
+            out.append(finding)
+            continue
+        used.add(hit)
+        waiver = waivers[hit]
+        out.append(
+            replace(
+                finding,
+                severity=Severity.INFO,
+                message=f"[waived by {waiver.by}: {waiver.reason}] {finding.message}",
+            )
+        )
+    for index, waiver in enumerate(waivers):
+        if index not in used:
+            out.append(
+                Finding(
+                    "waivers",
+                    Severity.INFO,
+                    f"waiver for {waiver.check} in {waiver.file or 'any file'} matched nothing",
+                    context=waiver.line_excerpt[:120],
+                )
+            )
+    return out
 
 
 def lint_kit(kit_dir: Path) -> LintReport:
@@ -1700,24 +1839,40 @@ def lint_kit(kit_dir: Path) -> LintReport:
             [Finding("kit-layout", Severity.REVIEW, f"no source chunks in {chunks_dir}")]
         )
 
+    from src.fidelity import check_pair
+
     findings: list[Finding] = []
     translations: list[str] = []
     ratios: list[tuple[str, float]] = []
+    require_sentinel = kit_requires_sentinel(kit_dir)
+    # (first line in the combined text, label, line offset in the file) per
+    # fragment, to report LaTeX findings as translated/NNN.tex:L.
+    origins: list[tuple[int, str, int]] = []
+    combined_line = 1
 
     for source_path in sources:
         target_path = translated_dir / f"{source_path.stem}{TRANSLATED_SUFFIX}"
+        label = f"translated/{target_path.name}"
         if not target_path.exists():
             findings.append(
                 Finding(
                     "missing-translation",
                     Severity.REVIEW,
                     f"chunk {source_path.stem} has no translation at {target_path}",
+                    file=label,
                 )
             )
             continue
         source = source_path.read_text(encoding="utf-8")
-        translation = strip_wrapping_fence(target_path.read_text(encoding="utf-8"))
-        findings += lint_chunk_pair(source_path.stem, source, translation)
+        raw = target_path.read_text(encoding="utf-8")
+        translation = strip_wrapping_fence(raw)
+        findings += lint_chunk_pair(
+            source_path.stem, source, translation, require_sentinel=require_sentinel, file=label
+        )
+        findings += check_pair(source, translation, file=label)
+        offset = raw[: raw.find(translation)].count("\n") if translation and translation in raw else 0
+        origins.append((combined_line, label, offset))
+        combined_line += translation.count("\n") + 2  # joined with a blank line
         translations.append(translation)
         source_prose = _prose_length(source)
         if source_prose:
@@ -1744,15 +1899,35 @@ def lint_kit(kit_dir: Path) -> LintReport:
         # Restore the real paths before the LaTeX checks run. The saved
         # replies still carry IMG_nnnn tokens, so linting them as-is would
         # report every single token as a figure that does not resolve.
-        findings += lint_latex(
-            _restore_for_lint(combined, map_path), base_dir=kit_dir, preamble=preamble
-        ).findings
+        findings += [
+            _locate(f, origins)
+            for f in lint_latex(
+                _restore_for_lint(combined, map_path),
+                base_dir=kit_dir,
+                preamble=preamble,
+                extra_commands=load_known_commands(kit_dir),
+            ).findings
+        ]
 
     if map_path.exists():
         findings += _check_image_map(kit_dir, map_path, translations)
         findings += _check_figures(kit_dir / FIGURES_NAME, map_path, translations)
 
-    return LintReport(findings)
+    waivers, waiver_problems = load_waivers(kit_dir)
+    return LintReport(apply_waivers(findings, waivers) + waiver_problems)
+
+
+def _locate(finding: Finding, origins: list[tuple[int, str, int]]) -> Finding:
+    """A finding on the combined translation, re-pointed at the fragment and
+    line it came from -- what a waiver names and what an editor opens."""
+    if not finding.line or finding.file or not origins:
+        return finding
+    start, label, offset = origins[0]
+    for first, name, shift in origins:
+        if first > finding.line:
+            break
+        start, label, offset = first, name, shift
+    return replace(finding, file=label, line=finding.line - start + 1 + offset)
 
 
 def _check_figures(figures_path: Path, map_path: Path, translations: list[str]) -> list[Finding]:
@@ -1975,13 +2150,29 @@ def strip_wrapping_fence(text: str) -> str:
     AI Studio adds ````latex` around the answer regardless of the prompt
     telling it not to, and the fence markers are not LaTeX: left in, they are
     typeset into the book as three literal backticks.
+
+    A fenced reply that ends with the ``% END-OF-CHUNK`` sentinel after its
+    closing fence keeps the sentinel, as its last line.
     """
-    return _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", text))
+    sentinel = has_sentinel(text)
+    body = strip_sentinel(text) if sentinel else text
+    body = _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", body))
+    return f"{body.rstrip()}\n{SENTINEL}\n" if sentinel else body
 
 
 __all__ = [
     "IMG_TOKEN_RE",
     "KNOWN_COMMANDS",
+    "KNOWN_COMMANDS_NAME",
+    "SENTINEL",
+    "WAIVERS_NAME",
+    "Waiver",
+    "apply_waivers",
+    "has_sentinel",
+    "kit_requires_sentinel",
+    "load_known_commands",
+    "load_waivers",
+    "strip_sentinel",
     "TRANSLATED_SUFFIX",
     "Finding",
     "LintReport",

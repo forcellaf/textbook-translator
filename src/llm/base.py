@@ -1,12 +1,18 @@
-"""Provider-agnostic LLM interface.
+"""The LLM interface every pipeline stage depends on.
 
-Every concrete provider (Gemini, OpenAI, etc.) must implement this interface.
-Pipeline stages (meta_profiler.py, translator.py, renderer.py) depend only on
-`BaseLLM`, never on a specific provider SDK.
+Two implementations exist: `src.llm.providers.anthropic.AnthropicProvider`
+(the Messages API) and `src.llm.exchange.ExchangeLLM` (request files an agent
+answers, for no-API mode). Pipeline stages (profiler, structure, figures,
+translator) depend only on these interfaces, never on either backend, and
+ask `src.llm.factory` for one per *role*.
 
 Image input is a separate interface, `VisionLLM`, because it is a separate
-model: a provider's text model generally does not take images, and a stage
-that needs both asks the factory for each one.
+role: the figure classifier runs on its own (cheaper) model.
+
+``temperature`` is still part of the signatures so existing call sites and
+test fakes keep working, but the Claude models in use reject non-default
+sampling parameters and the provider does not send it -- determinism comes
+from the on-disk caches instead (see the provider's docstring).
 """
 
 from abc import ABC, abstractmethod
