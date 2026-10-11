@@ -1,10 +1,8 @@
 # translation_project
 
-Translates scanned textbooks (Chinese → English) into a typeset PDF, with
-Claude as the only LLM.
+Translates scanned textbooks (Chinese → English) into a typeset PDF.
 
-The pipeline is **page range → parse → prepare → translate → lint → build →
-publish**. Parsing is an HTTP call to the MinerU cloud API (OCR, not an LLM);
+The pipeline is **page range → parse → prepare → translate → lint → build**. Parsing is an HTTP call to the MinerU cloud API (OCR, not an LLM);
 everything else is local CPU work plus Claude. There is no GPU step and no
 notebook.
 
@@ -154,6 +152,7 @@ claude auth status
 ```
 data/work/<book_name>/
 ├── page_range.json     the body's physical pages, decided before parsing (hand-editable)
+├── book_meta.json      title, authors, publisher for the English cover page (hand-editable)
 ├── page_images/        thumbnails rendered for that decision (p0001.png = physical page 1)
 ├── source_body.pdf     pages start..end, the only part that is parsed
 ├── parse_batch.json    the MinerU batch in flight, for resuming
@@ -246,6 +245,36 @@ The policy:
 
 `first_chapter_number` is checked in stage 2 against the preamble's
 `\setcounter{chapter}`.
+
+**The cover page.** From the same pages the finder reads the title,
+authors and publisher and writes `data/work/<book>/book_meta.json`:
+
+```json
+{
+  "title": "电路原理学习指导与习题集",
+  "title_en": "Learning Guide and Exercises for Principle of Electric Circuits",
+  "subtitle_en": null,
+  "authors": ["朱桂萍", "刘秀成", "徐福媛"],
+  "authors_en": ["Zhu Guiping", "Liu Xiucheng", "Xu Fuyuan"],
+  "publisher": "清华大学出版社",
+  "publisher_en": "Tsinghua University Press",
+  "evidence": "p1 cover, p3 title page",
+  "by": "agent"
+}
+```
+
+Assembly typesets the `*_en` fields as a title page before the table of
+contents — "English Translation", the title large and bold, the authors, the
+publisher at the foot — and sets the PDF's title and author metadata. Names
+are pinyin, family name first; a publisher with an established English name
+uses it.
+
+Many PDFs start directly at chapter 1, with no cover or title page, and
+carry no document metadata either. Then the finder records nulls rather than
+guessing, the book is built without a cover, and the run log says so. Supply
+the data by hand — `book_meta.json` with at least `title_en`, and
+`"by": "manual"` so no run overwrites it — and rebuild; nothing needs
+re-translating.
 
 ## Stage 1b — Parse
 
@@ -553,15 +582,24 @@ uv run python scripts/build_pdf.py data/work/physics/kit --publish
 
 Lints the kit, concatenates the replies, rewrites every `\bookfig` /
 `\bookfigtwo` from `figures.json`, restores the real image filenames, wraps
-the result in the preamble, and runs `pdflatex` twice (the second pass fills
-in the table of contents).
+the result in the preamble, adds the cover page from `book_meta.json`, and
+runs `pdflatex` twice (the second pass fills in the table of contents).
+
+**Wide tables are scaled to fit.** English cell text is longer than the
+Chinese it replaces, and a `tabular` with `l` columns never wraps, so a
+translated table can run off the right margin. Assembly wraps every outermost
+`tabular` in `\bookfittable{...}`, which measures the table and scales it
+down to the line width only if it is wider; a table that fits is untouched.
+It needs only `graphicx`, and is applied at build time, so existing
+translations are fixed by rebuilding. (`tabular*`, `tabularx` and `longtable`
+set or span their own width and are left alone.)
 
 | Flag | Purpose |
 |---|---|
 | `--no-lint` | Build even when findings need review |
 | `--fix` | Apply the safe repairs to the assembled `.tex` first |
 | `--engine` | Default `pdflatex` |
-| `--json` | Print a summary: lint counts, assembly problems, every LaTeX error located as `translated/NNN.tex:L` |
+| `--json` | Print a summary: lint counts, assembly problems, `cover_page`, `tables_fitted`, every LaTeX error located as `translated/NNN.tex:L` |
 | `--publish` | Afterwards, copy the deliverables to `data/output/<book>/` |
 
 When the build fails, it compiles once more without `-halt-on-error` and lists

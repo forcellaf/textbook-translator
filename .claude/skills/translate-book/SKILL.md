@@ -67,23 +67,36 @@ Front matter (cover, title, copyright, preface, table of contents) and
 non-content back matter are where parsing fails. Cut them before parsing.
 LaTeX builds its own table of contents.
 
-- **Skip if already parsed:** skip this step if `merged.md` is current.
-  Never re-parse just to trim. If `page_range.json` exists with `"by":
-  "manual"`, use it as is.
+The same pages give the book's title, authors and publisher, which become
+the English cover page (`book_meta.json`, typeset at assembly).
+
+- **Skip if already parsed:** skip the range decision if `merged.md` is
+  current. Never re-parse just to trim. If `page_range.json` exists with
+  `"by": "manual"`, use it as is. If `book_meta.json` is missing, still
+  render pages 1-10 and spawn the finder with **metadata only**.
 - **Render thumbnails:** run
   `uv run python scripts/render_pages.py <pdf> data/work/<book>/page_images --pages 1-40,<last 40> --dpi 60`.
   If the first chapter isn't within the first 40 pages, the finder asks for
   more by returning `need pages <range>`. Render those and re-spawn it.
 - **Spawn `page-range-finder`** with the work dir and the rendered ranges.
-  It writes `page_range.json` and returns one line.
+  It writes `page_range.json` and `book_meta.json` and returns one line.
 - **Verify the boundaries yourself.** Render the pages on each side of
   `start` and `end` at `--dpi 150` and look at them; that is four images.
   - Correct the file if needed and set `"by": "agent"`.
   - Check `first_chapter_number` against the chapter page you see.
+- **Verify the cover data.** Render the title page at `--dpi 150` and check
+  `book_meta.json` against it: every author present, names in pinyin,
+  `title_en` faithful to the Chinese title. Correct it if needed
+  (`"by": "agent"`). A `"by": "manual"` file is used as is. If the PDF has
+  no cover or title page (it starts at chapter 1), the title is unknown:
+  never invent one. Build without a cover and log it under Uncertainties:
+  "no cover page — add `data/work/<book>/book_meta.json` (`title_en`,
+  `authors_en`, `publisher_en`, `"by": "manual"`) and rebuild".
 - **Log** the range, every excluded block with its kind, and the
   confidence. If confidence is `low` and you can't resolve it by looking,
   choose the *earlier* start and the *later* end (a little junk beats lost
-  content) and log it as an uncertainty.
+  content) and log it as an uncertainty. Log the English title, authors and
+  publisher used for the cover.
 
 ## Step 1b — Parse
 
@@ -195,7 +208,9 @@ LaTeX builds its own table of contents.
 
 1. **Build:** run `uv run python scripts/build_pdf.py <kit> --json`, which
    lints first. Do not pass `--no-lint` unless every remaining review
-   finding is waived or logged as accepted.
+   finding is waived or logged as accepted. The summary's `cover_page` must
+   be true (otherwise fix `book_meta.json`); `tables_fitted` counts the
+   tables scaled to the text width — look at the widest one in the PDF.
 2. **On failure:** send the error list (already located as
    `translated/NNN.tex:L`) through `output-digester` if it is long, fix,
    and rebuild.

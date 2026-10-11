@@ -51,6 +51,7 @@ from pathlib import Path
 
 from src.build import chunk_marker
 from src.config import KIT_CHUNK_CHARS
+from src.cover import cover_latex, find_book_meta, load_book_meta
 from src.figures import DEFAULT_WIDTH, FIGURES_NAME, FigureRecord, load_figures
 from src.latex import assemble_document, build_system_prompt, preamble_for
 from src.lint import (
@@ -320,8 +321,17 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
                 "argument and stayed as text"
             )
 
+    # The cover page, from book_meta.json. Its absence is reported, never
+    # a problem: problems gate the build, and a missing cover is cosmetic.
+    meta, notes = load_book_meta(find_book_meta(kit_dir))
+    for note in notes:
+        logger.warning("Cover: %s", note)
+
     out_path = assemble_document(
-        [merged], kit_dir / ASSEMBLED_NAME, preamble_path=preamble_for(kit_dir)
+        [merged],
+        kit_dir / ASSEMBLED_NAME,
+        preamble_path=preamble_for(kit_dir),
+        cover=cover_latex(meta) if meta else "",
     )
     logger.info("Assembled %s (%d chars of translated body)", out_path, len(merged))
     return out_path, problems

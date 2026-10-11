@@ -126,10 +126,15 @@ def _build(kit_dir: Path, args: argparse.Namespace, summary: dict) -> tuple[int,
         summary.update(stage="assemble", succeeded=False)
         return 1, BuildResult(False, str(exc))
 
-    print(f"\nassembled {assembled} ({len(assembled.read_text(encoding='utf-8')):,} chars)")
+    assembled_text = assembled.read_text(encoding="utf-8")
+    print(f"\nassembled {assembled} ({len(assembled_text):,} chars)")
     for problem in problems:
         print(f"  WARNING: {problem}")
     summary["assembly_problems"] = problems
+    summary["cover_page"] = "\\begin{titlepage}" in assembled_text
+    summary["tables_fitted"] = assembled_text.count("\\bookfittable{\\begin{tabular}")
+    if not summary["cover_page"]:
+        print("  note: no cover page -- write book_meta.json (see src/cover.py)")
 
     if problems and not args.no_lint:
         message = "Not building: resolve the assembly warnings, or pass --no-lint."
