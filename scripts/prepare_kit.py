@@ -166,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             f"\nprofile: {profile.subject}/{profile.subfield or '-'}, "
             f"{len(profile.glossary)} glossary term(s), "
             f"{len(profile.heading_levels)} classified heading(s)"
+            + (f" [by {profile.by}]" if profile.by else "")
         )
         text, counts = apply_heading_levels(text, profile)
         print(
@@ -236,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     text, removed = strip_dropped_images(text, figures.records)
     if removed:
         print(f"  removed {removed} dropped image reference(s) from the text")
-    print(f"  correct any of them in {kit_dir / FIGURES_NAME} (set \"by\": \"manual\")")
+    print(f"  correct any of them in {kit_dir / FIGURES_NAME} (set \"by\": \"manual\" or \"agent\")")
     if has_pending(work_dir):
         return _stop_for_answers(work_dir, "figures")
     write_pending(work_dir)  # nothing pending: clears a stale manifest

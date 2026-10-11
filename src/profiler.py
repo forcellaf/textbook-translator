@@ -31,6 +31,7 @@ from pathlib import Path
 from src.config import SOURCE_LANG, TARGET_LANG
 from src.llm.base import BaseLLM
 from src.llm.exchange import ExchangePending
+from src.provenance import is_protected
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,10 @@ class BookProfile:
     heading_levels: tuple[tuple[str, int], ...] = ()
     # Lines the parser marked as headings that are really body text.
     non_headings: tuple[str, ...] = ()
+    # Who last edited the cached profile: empty for the LLM, "manual" or
+    # "agent" for a hand edit, which --force-profile then refuses to discard
+    # (see src.provenance).
+    by: str = ""
 
     @classmethod
     def generic(cls) -> "BookProfile":
@@ -109,6 +114,7 @@ class BookProfile:
                 # book_profile.json and fix one heading level by hand.
                 "heading_levels": {text: level for text, level in self.heading_levels},
                 "non_headings": list(self.non_headings),
+                **({"by": self.by} if self.by else {}),
             },
             indent=2,
             ensure_ascii=False,
@@ -143,6 +149,7 @@ class BookProfile:
             summary=_as_str(data, "summary", defaults.summary),
             heading_levels=_as_heading_levels(data.get("heading_levels")),
             non_headings=_as_str_tuple(data.get("non_headings")),
+            by=_as_str(data, "by", ""),
         )
 
 
@@ -566,6 +573,17 @@ def profile_book(
         went wrong. Never raises.
     """
     cache_path = work_dir / PROFILE_FILENAME
+
+    if force and cache_path.exists():
+        cached = _load_cached(cache_path)
+        if cached is not None and is_protected(cached.by):
+            logger.warning(
+                "%s is marked \"by\": %r; --force-profile keeps it. Remove the field "
+                "to profile the book again.",
+                cache_path,
+                cached.by,
+            )
+            return cached
 
     if not force and cache_path.exists():
         cached = _load_cached(cache_path)

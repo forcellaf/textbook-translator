@@ -59,6 +59,7 @@ from src.config import (
     TARGET_LANG,
 )
 from src.latex import assemble_document, build_system_prompt, validate_fragment
+from src.lint import SENTINEL, has_sentinel, strip_sentinel
 from src.llm.base import BaseLLM
 from src.profiler import BookProfile, profile_book
 
@@ -94,6 +95,13 @@ _RETRY_WAIT = wait_exponential(multiplier=1, min=1, max=60)
 
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t]*\n")
 _FULL_FENCE_RE = re.compile(r"\A```[a-zA-Z0-9_+-]*\n(.*)\n```\Z", re.DOTALL)
+
+
+# The system prompt asks for `% END-OF-CHUNK` as the last line of every reply;
+# a reply without it was cut off, whatever its length. The provider also
+# raises on stop_reason == "max_tokens" -- this is the second, model-side
+# check, and the only one an answer from outside the API can carry.
+SENTINEL_REQUIRED = True
 
 
 class TranslationError(RuntimeError):
@@ -193,8 +201,13 @@ def _strip_wrapping_fence(text: str) -> str:
     Only when the whole answer is one fenced block -- a document containing
     legitimate fenced code blocks must keep them.
     """
-    match = _FULL_FENCE_RE.match(text.strip())
-    return match.group(1).strip() if match else text.strip()
+    text = text.strip()
+    # A fenced reply still ends with the sentinel -- after the fence.
+    sentinel = has_sentinel(text)
+    body = strip_sentinel(text).strip() if sentinel else text
+    match = _FULL_FENCE_RE.match(body)
+    body = match.group(1).strip() if match else body
+    return f"{body}\n{SENTINEL}" if sentinel else body
 
 
 # ── Source-language residue ─────────────────────────────────────────────────
@@ -337,7 +350,8 @@ def _diagnose(
 ) -> str | None:
     """Return a human-readable description of what's wrong with ``output``,
     or None if it looks usable."""
-    stripped = output.strip()
+    with_sentinel = output.strip()
+    stripped = strip_sentinel(with_sentinel).strip()
 
     if not stripped or (
         len(source) > _SHORT_SOURCE_FLOOR and len(stripped) < _MIN_LENGTH_RATIO * len(source)
@@ -345,6 +359,12 @@ def _diagnose(
         return (
             f"output was empty or implausibly short ({len(stripped)} chars "
             f"for {len(source)} chars of input)"
+        )
+
+    if SENTINEL_REQUIRED and not has_sentinel(with_sentinel):
+        return (
+            f"the reply does not end with the line {SENTINEL}, so it was cut off before "
+            "the end of the excerpt"
         )
 
     residue = _source_residue(stripped, source_lang, target_lang)
@@ -411,7 +431,7 @@ def translate_chunk(
     # Layer 2: the API is answering, the answer is just unusable.
     for attempt in range(1, MAX_HEAL_ATTEMPTS + 1):
         if problem is None:
-            return result
+            return strip_sentinel(result).strip()
         logger.warning(
             "Chunk translation problem (heal attempt %d/%d): %s",
             attempt,
@@ -431,7 +451,7 @@ def translate_chunk(
             MAX_HEAL_ATTEMPTS,
             problem,
         )
-    return result
+    return strip_sentinel(result).strip()
 
 
 # ── Document translation ────────────────────────────────────────────────────

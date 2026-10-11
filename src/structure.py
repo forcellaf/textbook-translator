@@ -44,8 +44,9 @@ Every book has its own conventions, so no fixed rule may decide. The steps:
    into headings, go back to being paragraphs.
 
 Decisions are cached in ``<work-dir>/structure.json``, which is meant to be
-opened and corrected: set an entry's ``"by"`` to ``"manual"`` and its
-``"kind"`` (and ``"number"``) win on the next run.
+opened and corrected: set an entry's ``"by"`` to ``"manual"`` (a person) or
+``"agent"`` (the unattended orchestrator) and its ``"kind"`` (and
+``"number"``) win on the next run -- see `src.provenance`.
 
 With no LLM, or when the outline call fails, the numbering rules are the
 fallback and the outline says so. Nothing here raises.
@@ -64,6 +65,7 @@ from src.config import SOURCE_LANG
 from src.llm.base import BaseLLM
 from src.llm.exchange import ExchangePending
 from src.profiler import extract_json_object
+from src.provenance import is_protected
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +134,7 @@ class Division:
     kind: str | None = None  # part | chapter | reading | other; None = undecided
     number: int | None = None  # chapter number, when known
     clean_title: str = ""  # the title without its 第12章 / Part II label
-    decided_by: str = ""  # llm | follow-up | manual | rules
+    decided_by: str = ""  # llm | follow-up | manual | agent | rules
     reason: str = ""
     rule_kind: str | None = None  # the numbering rules' opinion
     rule_number: int | None = None
@@ -352,7 +354,7 @@ def _label_outline(
         index = answer.get("row")
         if isinstance(index, int) and 1 <= index <= len(divisions):
             division = divisions[index - 1]
-            if division.decided_by != "manual" and _apply_answer(division, answer, "llm"):
+            if not is_protected(division.decided_by) and _apply_answer(division, answer, "llm"):
                 labelled += 1
     return labelled > 0
 
@@ -465,7 +467,7 @@ def conflicts(divisions: list[Division]) -> dict[int, str]:
             if following is None or following.kind == PART:
                 add(index, "a part with no chapter after it")
 
-    return {i: p for i, p in found.items() if divisions[i].decided_by != "manual"}
+    return {i: p for i, p in found.items() if not is_protected(divisions[i].decided_by)}
 
 
 def _follow_up_prompt(source_lang: str) -> str:
@@ -574,7 +576,7 @@ def _fall_back_to_rules(divisions: list[Division]) -> None:
             if division.rule_kind == CHAPTER:
                 division.number = division.rule_number
             continue
-        if division.decided_by == "manual" or division.kind is not None:
+        if is_protected(division.decided_by) or division.kind is not None:
             continue
         if division.rule_kind:
             division.kind, division.number = division.rule_kind, division.rule_number
@@ -596,7 +598,7 @@ def analyze_structure(
         text: The book's Markdown, with heading levels already corrected.
         llm: Labels the outline. ``None`` falls back to the numbering rules,
             unchecked, and says so.
-        cache_path: ``structure.json``. Manual entries always win; earlier
+        cache_path: ``structure.json``. Manual and agent entries always win; earlier
             LLM labels are reused, without a call, unless ``force`` or a
             heading is new.
         first_chapter: The chapter number the preamble starts at, to warn
@@ -609,10 +611,10 @@ def analyze_structure(
     for division in divisions:
         rule_opinion(division)
         entry = cache.get(division.title, {})
-        if entry.get("by") == "manual" and entry.get("kind") in KINDS:
+        if is_protected(entry.get("by")) and entry.get("kind") in KINDS:
             _restore(division, entry)
 
-    open_rows = [d for d in divisions if d.decided_by != "manual"]
+    open_rows = [d for d in divisions if not is_protected(d.decided_by)]
     reusable = not force and open_rows and all(
         cache.get(d.title, {}).get("by") in ("llm", "follow-up")
         and cache[d.title].get("kind") in KINDS
@@ -753,7 +755,9 @@ def render_outline(report: StructureReport) -> str:
         else:
             label, indent = "   ?", "  "
 
-        if division.rule_kind is None or division.decided_by in ("rules", "manual"):
+        if division.rule_kind is None or division.decided_by == "rules" or is_protected(
+            division.decided_by
+        ):
             check = ""
         elif division.rule_kind == division.kind:
             check = " (rules agree)"

@@ -89,3 +89,71 @@ work dir, as the schema says.
 same id finds the same file on every run, so a bad answer cannot loop. To
 re-ask, delete `llm/responses/<id>.txt`. `--reclassify` / `--force-*` discard
 cached *decisions* only; an unchanged prompt still finds its old answer.
+
+## Phase 3 — fidelity lint, sentinel, waivers, allowlist, `by: agent`
+
+**Calibrated on real data.** Thresholds and normalisation were tuned on the 89
+translated chunk pairs of the five books in `data/work/` (eee_1, eee_2,
+eee_practice, physics_2_pipeline, physics_2_study_guide). First pass: 541
+number findings alone. Final: 52 review findings over 89 chunks (blocks 17,
+display count 8, numbers 23, tags 4), nearly all real drift or the model
+"correcting" OCR (`u_{01}` -> `u_{o1}`, `/ψ` -> `∠ψ`), plus one silent sign
+change the old lint could not see (`= \frac` -> `= - \frac`, eee_practice/012).
+`BLOCK_SIMILARITY = 0.85`; formatting-only pairs score above it once
+normalised.
+
+**Normalisation beyond the brief's list**, each driven by a real false
+positive: bold (`\mathbf`, `\boldsymbol`) is presentation (the parser drops
+vector bold, the model restores it); `array` is an alignment wrapper (added or
+removed around the same lines); a word of 3+ letters in a font command is
+prose (`P_{损}` -> `P_{\mathrm{loss}}`); `\mathrm{cos}` is `\cos`; `\bar` is
+`\overline`; footnote markers (`^{①}`, `\textcircled{1}`) are dropped (the
+prompt tells the model to delete them); sentence punctuation closing a display
+is dropped; empty `( )` left by removed CJK is dropped; thin spaces inside a
+number join it (`1\,000`).
+
+**Numbers: a value that moved between prose and math is not a change.** The
+source often writes `I=-60 mA` or `3.4×10⁻³` as plain text and the
+translation, correctly, as math. Only the *exact* value (sign and `^`
+exponent marker included, superscripts and HTML `<sup>` read as exponents)
+gets that pass, so `10^{-20}` -> `10^{-2}` and a flipped sign still fire.
+
+**Numbers: absent on one side is review; a different count is info.** The
+brief asks for a multiset. On real data, nearly every count-only difference
+was `0`, `2` or `^2` one apart (a formula rewritten or split). Those are still
+reported, as one info finding per chunk; a value missing from one side
+entirely is review. Subscript numbers are marked `_` (`u_{02}` -> `_02`) so a
+label never masks a value.
+
+**Display count: a display that is inline math on the other side was moved,
+not lost.** The model promotes `$F = qE$` to a display and back; that is
+reported as info. Only unexplained losses/additions are review.
+
+**Tags:** only displays can end in a written-out `(12.3)`; inline `$(12.3)$`
+is a reference. A tag alone on its line (`(3.5.1)` -- the parser lost the
+formula and kept its number) counts as a source tag.
+
+**Known limitation, kept explicit:** a swapped subscript in a long display may
+score above the threshold; the numbers check does not see it (labels are the
+same multiset). Short displays fire.
+
+**Sentinel only where the kit asks for it.** `truncated-sentinel` applies when
+`kit/system_prompt.txt` contains `% END-OF-CHUNK`; kits built before it (all
+five existing books) are not held to it. A fenced reply keeps the sentinel
+after its closing fence, so both fence strippers look past it.
+
+**Lint findings now carry `file` and a per-file line.** LaTeX checks run on
+the concatenated book; `lint_kit` maps each line back to
+`translated/NNN.tex:L`. Waivers match on `check`, `file` and a whitespace-
+collapsed `line_excerpt` substring of the message or context (empty excerpt =
+every finding of that check in that file). A waiver without a reason is
+refused (review); a waiver that matched nothing is reported (info) so stale
+ones are noticed. `Finding`/`Severity`/`LintReport` moved to `src/findings.py`
+(re-exported by `src.lint`) so `src.fidelity` does not import `src.lint`.
+
+**`by: agent`** (`src/provenance.py`): protected like `manual` in
+structure.json, figures.json and book_profile.json (a top-level `by` field,
+honoured by `--force-profile`). Decided rows are no longer flagged or counted
+as "flagged" figures. "Manual beats agent": both are immune to the pipeline;
+between the two, the skill forbids the agent from editing a `manual` entry,
+and `provenance.stronger()` ranks them wherever two could compete.

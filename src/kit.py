@@ -58,6 +58,7 @@ from src.lint import (
     TRANSLATED_SUFFIX,
     _braced_argument,
     latex_image_refs,
+    strip_sentinel,
     strip_wrapping_fence,
 )
 from src.profiler import BookProfile
@@ -288,7 +289,8 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
             problems.append(f"chunk {source_path.stem} has no translation saved")
             continue
         raw = target_path.read_text(encoding="utf-8")
-        body = strip_wrapping_fence(raw).strip()
+        # The `% END-OF-CHUNK` sentinel has done its job once lint has seen it.
+        body = strip_sentinel(strip_wrapping_fence(raw)).strip()
         # A comment naming the fragment and the line its body starts on, so
         # an error at line 6,532 of the assembled book can be reported as
         # translated/008.tex:39 -- see `src.build.collect_errors`.

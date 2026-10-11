@@ -26,8 +26,9 @@ reliably; assembly (``src.kit``) applies these records at build time. So a
 wrong width, number or drop is fixed by editing one JSON line and
 rebuilding, and translations made before this module existed stay valid.
 
-Records with ``"by": "manual"`` are never overwritten -- the same convention
-as ``structure.json``.
+Records with ``"by": "manual"`` (a person) or ``"by": "agent"`` (the
+unattended orchestrator) are never overwritten -- the same convention as
+``structure.json``; see `src.provenance`.
 
 MinerU's layout data (``content_list.json``)
 --------------------------------------------
@@ -77,6 +78,7 @@ from src.config import (
 from src.llm.base import VisionLLM, image_mime_type
 from src.llm.exchange import ExchangePending
 from src.profiler import extract_json_object
+from src.provenance import AGENT, is_protected
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,7 @@ BY_CAPTION = "caption"
 BY_CLASSIFIER = "classifier"
 BY_DEFAULT = "default"
 BY_MANUAL = "manual"
+BY_AGENT = AGENT
 
 FIGURE = "figure"
 DECORATION = "decoration"
@@ -725,7 +728,8 @@ class FiguresReport:
 
     @property
     def flagged(self) -> list[str]:
-        return [n for n, r in self._ordered() if r.keep and r.flags]
+        # A decided (manual or agent) record is no longer waiting for anyone.
+        return [n for n, r in self._ordered() if r.keep and r.flags and not is_protected(r.by)]
 
     @property
     def defaulted(self) -> list[str]:
@@ -740,7 +744,7 @@ class FiguresReport:
         return Counter(
             r.label or "none"
             for _, r in self._ordered()
-            if not r.number and not r.panel_of and r.by != BY_MANUAL
+            if not r.number and not r.panel_of and not is_protected(r.by)
         )
 
     def render(self) -> str:
@@ -818,7 +822,8 @@ def build_figures(
     records: dict[str, FigureRecord] = {}
     numbers: dict[str, str | None] = {}
 
-    manual = {name: r for name, r in existing.items() if r.by == BY_MANUAL}
+    # Manual and agent records are kept verbatim (manual and agent alike).
+    manual = {name: r for name, r in existing.items() if is_protected(r.by)}
 
     # Pass 1: numbers and widths, which need no model.
     for site in sites:
@@ -1128,7 +1133,7 @@ def apply_linked_widths(records: dict[str, FigureRecord], entries: list[dict]) -
     by_name = image_entries(entries)
     measured = 0
     for name, record in records.items():
-        if record.by == BY_MANUAL:
+        if is_protected(record.by):
             continue
         width = width_for(by_name.get(name), reference)
         record.flags = [f for f in record.flags if f != FLAG_NO_BBOX]
@@ -1207,7 +1212,8 @@ def write_review(
         f"<h1>Figure review &mdash; {counts}</h1>\n"
         "<p>Red: dropped. Yellow: kept, needs a look. Blue: kept with a default "
         f"width. To overrule a decision, edit the image's entry in {FIGURES_NAME}, "
-        'set <code>"by": "manual"</code>, and rebuild.</p>\n'
+        'set <code>"by": "manual"</code> (or <code>"agent"</code> for the orchestrator), '
+        "and rebuild.</p>\n"
         "<table><tr><th>image</th><th>file / token</th><th>decision</th><th>number</th>"
         "<th>label</th><th>reason</th><th>flags</th><th>by</th></tr>\n"
         f"{body}\n</table></body></html>\n"
@@ -1222,6 +1228,7 @@ __all__ = [
     "BY_CAPTION",
     "BY_CLASSIFIER",
     "BY_DEFAULT",
+    "BY_AGENT",
     "BY_MANUAL",
     "CONTENT_LIST_NAME",
     "FIGURES_NAME",
