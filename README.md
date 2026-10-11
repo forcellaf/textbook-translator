@@ -42,11 +42,24 @@ limitations and a spot-check list for a human.
 
 | Mode | Needs | Command |
 |---|---|---|
-| No-API (Claude Code subscription) | Claude Code logged in; no API key | `scripts/translate_unattended.sh data/input/physics.pdf [book_name]` |
+| No-API (Claude Code subscription) | the standalone `claude` CLI, logged in and current (see Setup); a bash shell (Git Bash on Windows); no API key | `scripts/translate_unattended.sh data/input/physics.pdf [book_name]` |
 | API (Claude Agent SDK) | `ANTHROPIC_API_KEY` | `uv sync --group agent` then `uv run --group agent python scripts/run_agent_sdk.py data/input/physics.pdf [book_name]` |
 | Interactive | Claude Code | `/model` → Opus 5.5 at high effort, then `/translate-book data/input/physics.pdf` |
 
 `book_name` defaults to the PDF's stem, lowercased, spaces as `_`.
+
+Claude Code loads skills and subagents when a session starts. After pulling
+changes to `.claude/`, start a new session; one opened earlier will not see
+`/translate-book` or the agents.
+
+**What has been verified.** A no-quota end-to-end run (2026-10-11, details in
+[docs/DECISIONS.md](docs/DECISIONS.md)) took two chunks of `eee_1` from
+stage 2 to a published PDF in no-API mode: three exchange requests answered by
+agents, both chunks translated by Haiku translators, zero review findings,
+first build succeeded. Not yet run for real: the headless launcher
+(`translate_unattended.sh`) and everything in API mode (the provider, the
+batch translator and the Agent SDK launcher are tested against mocked HTTP
+only).
 
 **Output lands in `data/output/<book>/`**: `<book>_translated.pdf`,
 `<book>_translated.tex` (small, and enough to fix a typo and rebuild) and
@@ -110,7 +123,27 @@ ANTHROPIC_API_KEY=your-anthropic-key
 Get a MinerU token at <https://mineru.net/apiManage/token>. **No-API mode
 needs only `MINERU_TOKEN`**: Claude is your Claude Code subscription. With
 no `ANTHROPIC_API_KEY`, the pipeline's own LLM calls go through the exchange
-automatically.
+automatically. Settings from the old providers (`DEEPSEEK_*`, `GEMINI_*`,
+`LLM_PROVIDER`) are ignored and can be deleted.
+
+**4. The Claude Code CLI** (no-API mode's launcher). The headless launcher
+runs the standalone `claude` command, which has its own login, separate from
+the Claude desktop app. Update it so it knows `claude-opus-5-5`, then log in
+once, from an interactive terminal:
+
+```bash
+claude update
+```
+
+```bash
+claude auth login
+```
+
+```bash
+claude auth status
+```
+
+`claude auth status` should report `"loggedIn": true`.
 
 ---
 
@@ -624,6 +657,12 @@ are translated into actionable messages: `A0202` bad token, `A0211` expired,
 
 **`parse_book.py` exits 4** — the batch is still running server-side. Run the
 same command again; it resumes polling and never re-uploads.
+
+**The launcher stops at once with `401 Invalid bearer token`** (in
+`logs/translate-<book>-*.jsonl`) — the standalone `claude` CLI is not logged
+in. A `claude-code:unrecognized_model` warning in the same run means the CLI
+predates `claude-opus-5-5`. Run `claude update` and `claude auth login` (Setup,
+step 4).
 
 **`prepare_kit.py` exits 3** — no-API mode is waiting for answers in
 `llm/pending.json` (see The exchange).
