@@ -211,3 +211,50 @@ orchestrator retries it.
 `sync-chunks`, `build ok|failed`, `decide`. Writes are atomic (temp file +
 replace). A chunk's `attempts` counts translation outcomes
 (`translated`/`failed`), not `pending` resets.
+
+## Phase 5 — agent layer
+
+**Verified against the current docs and the installed tools** (Claude Code
+2.1.251, `claude-agent-sdk` 0.2.165): subagent frontmatter takes `model` (full
+IDs accepted) and `effort`; the spawning tool is `Agent`; nesting goes three
+levels deep by default (the preparer -> classifier/answerer path uses two);
+the CLI takes `-p`, `--model`, `--effort`, `--settings`, `--permission-mode`,
+`--output-format stream-json`; the SDK's options are `model`, `effort`,
+`cwd`, `setting_sources`, `skills`, `settings`, `env`, `permission_mode`, and a
+`/translate-book ...` prompt dispatches the project skill.
+
+**Appendix texts are installed verbatim.** The skill gains one appended section,
+"Command and file reference", listing names the implementation chose (exit
+codes 3 and 4, `run_state.py` subcommands, the waiver and allowlist formats,
+`--wait-minutes`). The agents were extracted from the brief mechanically.
+
+**Permission rules.** Edit rules govern Write too, so the allowlist uses
+`Read(/data/**)` and `Edit(/data/**)` (project settings anchor `/` at the
+repo root). Bash rules use the space form (`Bash(ls *)`, not `Bash(ls*)`):
+the docs say the no-space form also matches `lsof`. `uv sync *` is allowed for
+the preflight step.
+
+**The run-time deny rules live in `.claude/run-settings.json`**, passed with
+`--settings` by both launchers. In a `--settings` file a `/path` rule anchors
+at the file's own directory (`.claude/`), so the overlay uses `./src/**` etc.,
+relative to the repo root the launchers run from. Besides `src/`, `assets/`
+and `tests/` it also denies `scripts/` and `.claude/` -- the brief's "never
+change the tool mid-run" covers them as well.
+
+**`CLAUDE_CODE_MAX_OUTPUT_TOKENS=96000`** in the overlay only, matching the
+translate role's max_tokens (Haiku medium thinking + up to ~36k output tokens).
+
+**Unattended permission mode is `dontAsk`**: anything outside the allowlist is
+refused rather than prompting a person who is not there.
+
+**The no-API launcher unsets `ANTHROPIC_API_KEY` and exports
+`LLM_BACKEND=exchange`**: a key in the environment would bill the API and flip
+the pipeline to the API backend. The SDK launcher passes
+`env={"LLM_BACKEND": "anthropic"}`. `LLM_BACKEND` is deliberately not in the
+shared overlay, which both launchers use.
+
+**Agent SDK is the optional dependency group `agent`**
+(`uv sync --group agent`); plain `uv sync` does not install it.
+
+**`.claude/settings.local.json` and `.claude/worktrees/` are gitignored**; the
+shared settings, skill and agents are tracked.
