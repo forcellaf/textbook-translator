@@ -70,8 +70,57 @@
 % ---------------------------------------------------------
 % CUSTOM COMMANDS
 % ---------------------------------------------------------
-% Standard figure. Every figure in the book goes through this, so they are
-% all centred, all the same width, and all captioned the same way.
+% Figures. The translation writes \bookfig / \bookfigtwo; assembly
+% (src/kit.py) rewrites each one into \bookfigx / \bookfigtwox from the
+% book's figures.json, which carries every figure's width (measured on the
+% source page) and its number (copied from the source caption). LaTeX's own
+% figure counter is never printed: the prose cites the book's numbers ("as
+% shown in Figure 18.3"), and a counted number drifted by one after a
+% decorative chapter glyph was typeset as "Figure 18.1".
+%
+% Every \includegraphics is capped in height as well as width. With only a
+% width, keepaspectratio constrains nothing, and a tall figure that was
+% small in the original runs off the page.
+
+% #1 width (fraction of \textwidth), #2 file, #3 source number or empty,
+% #4 caption. An empty number prints no caption and no label at all.
+% A figure inside a table cell cannot be a float ("Not in outer par mode"),
+% so there it is set inline, small enough for several to share a row.
+\newlength{\cellfigw}
+\newcommand{\bookfigx}[4]{%
+  \ifinner
+    \setlength{\cellfigw}{#1\textwidth}%
+    \ifdim\cellfigw>0.16\textwidth \setlength{\cellfigw}{0.16\textwidth}\fi
+    \includegraphics[width=\cellfigw,height=0.1\textheight,keepaspectratio]{#2}%
+  \else
+  \begin{figure}[htbp]\centering
+    \includegraphics[width=#1\textwidth,height=0.45\textheight,keepaspectratio]{#2}%
+    \if\relax\detokenize{#3}\relax\else
+      \renewcommand{\thefigure}{#3}\caption{#4}%
+    \fi
+  \end{figure}\fi}
+
+% Two panels side by side, each at its own width (assembly scales the pair
+% so the two plus the gap between them never exceed the text width), sharing
+% one number.
+% #1 width A, #2 file A, #3 label A, #4 width B, #5 file B, #6 label B,
+% #7 source number or empty, #8 caption.
+\newcommand{\bookfigtwox}[8]{%
+  \begin{figure}[htbp]\centering
+    \begin{minipage}[b]{#1\textwidth}
+      \centering\includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{#2}\\[2pt]{\small #3}
+    \end{minipage}\hspace{0.04\textwidth}%
+    \begin{minipage}[b]{#4\textwidth}
+      \centering\includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{#5}\\[2pt]{\small #6}
+    \end{minipage}%
+    \if\relax\detokenize{#7}\relax\else
+      \renewcommand{\thefigure}{#7}\caption{#8}%
+    \fi
+  \end{figure}}
+
+% What the translation writes. Assembly rewrites these whenever the kit has
+% a figures.json; without one they are compiled as they are, height-capped
+% so they still never overflow the page.
 %
 %   \bookfig{IMG_0042}{Charge distribution inside a proton}
 %   \bookfig[0.85]{IMG_0107}{A wider diagram}
@@ -79,7 +128,7 @@
 \newcommand{\bookfig}[3][0.6]{%
   \begin{figure}[htbp]
     \centering
-    \includegraphics[width=#1\textwidth,keepaspectratio]{#2}
+    \includegraphics[width=#1\textwidth,height=0.45\textheight,keepaspectratio]{#2}
     \caption{#3}
   \end{figure}%
 }
@@ -92,10 +141,10 @@
   \begin{figure}[htbp]
     \centering
     \begin{minipage}{0.45\textwidth}
-      \centering\includegraphics[width=\textwidth,keepaspectratio]{#1}\\[2pt]{\small #2}
+      \centering\includegraphics[width=\textwidth,height=0.4\textheight,keepaspectratio]{#1}\\[2pt]{\small #2}
     \end{minipage}\hfill
     \begin{minipage}{0.45\textwidth}
-      \centering\includegraphics[width=\textwidth,keepaspectratio]{#3}\\[2pt]{\small #4}
+      \centering\includegraphics[width=\textwidth,height=0.4\textheight,keepaspectratio]{#3}\\[2pt]{\small #4}
     \end{minipage}
     \caption{#5}
   \end{figure}%
@@ -111,4 +160,4 @@
 % the first chapter is numbered 1 and its sections come out as 1.1, 1.2 ...
 % instead of 12.1, 12.2 -- which then disagrees with every cross-reference in
 % the prose. Set this to (first chapter number - 1).
-\setcounter{chapter}{11}
+\setcounter{chapter}{0}

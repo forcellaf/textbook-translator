@@ -19,6 +19,8 @@ from src.latex import (
     assemble_document,
     build_system_prompt,
     load_preamble,
+    preamble_first_chapter,
+    preamble_for,
     scan_environments,
     validate_fragment,
 )
@@ -93,6 +95,14 @@ def test_the_preamble_opens_the_document_and_does_not_close_it() -> None:
     assert preamble == PREAMBLE_PATH.read_text(encoding="utf-8")
 
 
+def test_a_kit_uses_its_own_preamble_only_when_it_has_one(tmp_path: Path) -> None:
+    assert preamble_for(tmp_path) == PREAMBLE_PATH
+
+    own = tmp_path / "preamble.tex"
+    own.write_text("\\setcounter{chapter}{13}\n\\begin{document}\n", encoding="utf-8")
+    assert preamble_for(tmp_path) == own
+
+
 # ── assemble_document ───────────────────────────────────────────────────────
 
 
@@ -113,11 +123,22 @@ def test_fragments_are_wrapped_in_the_preamble_exactly_once(tmp_path: Path) -> N
 
 
 def test_the_chapter_counter_survives_assembly(tmp_path: Path) -> None:
-    """This volume starts at chapter 12; without the counter every section
-    cross-reference in the prose disagrees with its heading."""
+    """A volume that starts partway through the book needs the counter; without
+    it every section cross-reference in the prose disagrees with its heading.
+    A kit's own preamble carries its own counter."""
+    first = preamble_first_chapter(load_preamble())
     output = assemble_document(["\\chapter{Electric Charge}"], tmp_path / "book.tex")
+    assert f"\\setcounter{{chapter}}{{{first - 1}}}" in output.read_text(encoding="utf-8")
 
-    assert "\\setcounter{chapter}{11}" in output.read_text(encoding="utf-8")
+    own = tmp_path / "preamble.tex"
+    own.write_text(
+        load_preamble().replace(f"\\setcounter{{chapter}}{{{first - 1}}}", "\\setcounter{chapter}{13}"),
+        encoding="utf-8",
+    )
+    output = assemble_document(
+        ["\\chapter{Diodes}"], tmp_path / "book2.tex", preamble_path=preamble_for(tmp_path)
+    )
+    assert preamble_first_chapter(output.read_text(encoding="utf-8")) == 14
 
 
 def test_preamble_leaked_into_a_body_is_dropped(tmp_path: Path) -> None:

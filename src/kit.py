@@ -51,8 +51,15 @@ from pathlib import Path
 
 from src.build import chunk_marker
 from src.config import KIT_CHUNK_CHARS
-from src.latex import assemble_document, build_system_prompt
-from src.lint import IMG_TOKEN_RE, TRANSLATED_SUFFIX, latex_image_refs, strip_wrapping_fence
+from src.figures import DEFAULT_WIDTH, FIGURES_NAME, FigureRecord, load_figures
+from src.latex import assemble_document, build_system_prompt, preamble_for
+from src.lint import (
+    IMG_TOKEN_RE,
+    TRANSLATED_SUFFIX,
+    _braced_argument,
+    latex_image_refs,
+    strip_wrapping_fence,
+)
 from src.profiler import BookProfile
 
 logger = logging.getLogger(__name__)
@@ -294,6 +301,10 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
     map_path = kit_dir / IMAGE_MAP_NAME
     if map_path.exists():
         mapping = json.loads(map_path.read_text(encoding="utf-8"))
+        figures_path = kit_dir / FIGURES_NAME
+        if figures_path.exists():
+            merged, figure_problems = apply_figures(merged, mapping, load_figures(figures_path))
+            problems += figure_problems
         merged, unknown = restore_images(merged, mapping)
         if unknown:
             problems.append(
@@ -307,9 +318,160 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
                 "argument and stayed as text"
             )
 
-    out_path = assemble_document([merged], kit_dir / ASSEMBLED_NAME)
+    out_path = assemble_document(
+        [merged], kit_dir / ASSEMBLED_NAME, preamble_path=preamble_for(kit_dir)
+    )
     logger.info("Assembled %s (%d chars of translated body)", out_path, len(merged))
     return out_path, problems
+
+
+# ── Figures ─────────────────────────────────────────────────────────────────
+
+_BOOKFIG_RE = re.compile(r"\\bookfig(two)?(?![A-Za-z])")
+
+# The pair never exceeds the text width: two minipages plus the
+# 0.04\textwidth gap \bookfigtwox puts between them.
+_PAIR_BUDGET = 0.96
+
+
+def _skip_space(text: str, index: int) -> int:
+    while index < len(text) and text[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _parse_bookfig(text: str, match: re.Match[str]) -> tuple[list[str], int] | None:
+    """The arguments of the ``\\bookfig`` / ``\\bookfigtwo`` at ``match``.
+
+    Returns ``(arguments, end)`` or None when the call is malformed, which is
+    left untouched for lint to report. An optional ``[width]`` is skipped:
+    ``figures.json`` decides the width, whatever the model wrote.
+    """
+    count = 5 if match.group(1) else 2
+    index = _skip_space(text, match.end())
+    if not match.group(1) and index < len(text) and text[index] == "[":
+        close = text.find("]", index)
+        if close == -1:
+            return None
+        index = _skip_space(text, close + 1)
+    arguments: list[str] = []
+    for _ in range(count):
+        index = _skip_space(text, index)
+        if index >= len(text) or text[index] != "{":
+            return None
+        found = _braced_argument(text, index)
+        if found is None:
+            return None
+        argument, index = found
+        arguments.append(argument)
+    return arguments, index
+
+
+def _in_comment(text: str, index: int) -> bool:
+    line_start = text.rfind("\n", 0, index) + 1
+    return re.search(r"(?<!\\)%", text[line_start:index]) is not None
+
+
+def _width(value: float) -> str:
+    return f"{value:.2f}"
+
+
+def apply_figures(
+    text: str, mapping: dict[str, str], records: dict[str, FigureRecord]
+) -> tuple[str, list[str]]:
+    """Rewrite the model's figure calls from ``figures.json``.
+
+    * ``\\bookfig{IMG_0042}{caption}`` -> ``\\bookfigx{0.42}{IMG_0042}{18.3}{caption}``
+      (the token is restored to a path afterwards, like every other one);
+    * a width the model emitted, ``\\bookfig[0.85]{...}``, is ignored;
+    * a dropped image's call is removed entirely;
+    * ``\\bookfigtwo`` becomes ``\\bookfigtwox``, each panel at its own
+      width, with the number of whichever panel carries one. If only one
+      panel was dropped, both are kept and the pair is reported.
+
+    Captions are brace-matched, never regex-matched: they contain math
+    with nested groups. Returns ``(text, problems)``.
+    """
+    problems: list[str] = []
+    missing: list[str] = []
+    pieces: list[str] = []
+    cursor = 0
+    rewritten = dropped = 0
+
+    def record_for(token: str) -> FigureRecord | None:
+        path = mapping.get(token.strip())
+        if path is None:
+            return None  # a corrupted token: restore_images reports it
+        record = records.get(Path(path).name)
+        if record is None:
+            missing.append(token.strip())
+        return record
+
+    for match in _BOOKFIG_RE.finditer(text):
+        if match.start() < cursor or _in_comment(text, match.start()):
+            continue
+        parsed = _parse_bookfig(text, match)
+        if parsed is None:
+            continue
+        arguments, end = parsed
+
+        if not match.group(1):
+            token, caption = arguments
+            if token.strip() not in mapping:
+                continue
+            record = record_for(token) or FigureRecord()
+            if not record.keep:
+                replacement = ""
+                dropped += 1
+            else:
+                replacement = (
+                    f"\\bookfigx{{{_width(record.width)}}}{{{token.strip()}}}"
+                    f"{{{record.number or ''}}}{{{caption}}}"
+                )
+                rewritten += 1
+        else:
+            first, first_label, second, second_label, caption = arguments
+            if first.strip() not in mapping or second.strip() not in mapping:
+                continue
+            a = record_for(first) or FigureRecord()
+            b = record_for(second) or FigureRecord()
+            if not a.keep and not b.keep:
+                replacement = ""
+                dropped += 1
+            else:
+                if a.keep != b.keep:
+                    gone = first if not a.keep else second
+                    problems.append(
+                        f"\\bookfigtwo{{{first.strip()}}}...{{{second.strip()}}}: {gone.strip()} "
+                        "is marked dropped but its pair is kept, so both were kept -- "
+                        "review it in figures.json"
+                    )
+                if a.number and b.number and a.number != b.number:
+                    problems.append(
+                        f"\\bookfigtwo{{{first.strip()}}}...{{{second.strip()}}} pairs two "
+                        f"numbered figures ({a.number}, {b.number}); printed as {b.number}"
+                    )
+                number = b.number or a.number or ""
+                scale = min(1.0, _PAIR_BUDGET / (a.width + b.width))
+                replacement = (
+                    f"\\bookfigtwox{{{_width(a.width * scale)}}}{{{first.strip()}}}{{{first_label}}}"
+                    f"{{{_width(b.width * scale)}}}{{{second.strip()}}}{{{second_label}}}"
+                    f"{{{number}}}{{{caption}}}"
+                )
+                rewritten += 1
+
+        pieces.append(text[cursor : match.start()])
+        pieces.append(replacement)
+        cursor = end
+
+    pieces.append(text[cursor:])
+    if missing:
+        problems.append(
+            f"{len(missing)} figure(s) have no {FIGURES_NAME} record and were set at the "
+            f"default width ({DEFAULT_WIDTH}) with no number: {sorted(set(missing))[:5]}"
+        )
+    logger.info("Figures: %d rewritten from %s, %d dropped", rewritten, FIGURES_NAME, dropped)
+    return "".join(pieces), problems
 
 
 def verify_images(text: str, kit_dir: Path) -> list[str]:
@@ -390,6 +552,7 @@ __all__ = [
     "ASSEMBLED_NAME",
     "IMAGE_MAP_NAME",
     "KitResult",
+    "apply_figures",
     "assemble",
     "build_kit",
     "chunk_text",

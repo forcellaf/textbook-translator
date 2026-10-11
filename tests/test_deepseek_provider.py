@@ -238,6 +238,81 @@ def test_factory_rejects_an_unknown_provider(monkeypatch: pytest.MonkeyPatch) ->
         get_llm()
 
 
+# ── Vision (figure classification) ──────────────────────────────────────────
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+
+
+def _vision_provider(monkeypatch: pytest.MonkeyPatch, outcome: object) -> DeepSeekProvider:
+    monkeypatch.setattr(config, "DEEPSEEK_VISION_MODEL", "deepseek-flash")
+    return _make_provider(monkeypatch, outcome)
+
+
+def test_vision_request_puts_the_image_in_the_user_message_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image in a system message is an HTTP 400 (DeepSeek vision guide)."""
+    provider = _vision_provider(monkeypatch, _response('{"label": "figure"}'))
+
+    provider.generate_with_images("Classify.", "Context.", [(PNG, "image/png")])
+
+    (call,) = _calls(provider)
+    system, user = call["messages"]
+    assert system == {"role": "system", "content": "Classify."}
+    assert user["role"] == "user"
+    text, image = user["content"]
+    assert text == {"type": "text", "text": "Context."}
+    assert image["type"] == "image_url"
+    assert image["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_vision_request_goes_to_the_vision_model_not_the_text_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _vision_provider(monkeypatch, _response("ok"))
+
+    provider.generate_with_images("s", "u", [(PNG, "image/png")])
+    provider.generate("s", "u")
+
+    vision_call, text_call = _calls(provider)
+    assert vision_call["model"] == "deepseek-flash"
+    assert text_call["model"] == "deepseek-v4-pro"
+    assert vision_call["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+def test_vision_image_type_is_read_from_the_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MinerU names every image `.jpg`; the declared type is not trusted."""
+    provider = _vision_provider(monkeypatch, _response("ok"))
+
+    provider.generate_with_images("s", "u", [(JPEG, "image/png")])
+
+    url = _calls(provider)[0]["messages"][1]["content"][1]["image_url"]["url"]
+    assert url.startswith("data:image/jpeg;base64,")
+
+
+def test_vision_keeps_the_error_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    transient = _vision_provider(monkeypatch, _status_error(429))
+    with pytest.raises(RuntimeError, match="deepseek-flash"):
+        transient.generate_with_images("s", "u", [(PNG, "image/png")])
+
+    permanent = _vision_provider(monkeypatch, _status_error(400))
+    with pytest.raises(ValueError):
+        permanent.generate_with_images("s", "u", [(PNG, "image/png")])
+
+
+def test_vision_factory_uses_the_existing_deepseek_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.llm.factory import get_vision_llm
+
+    monkeypatch.setattr(config, "DEEPSEEK_API_KEY", "fake-key")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "gemini")
+    assert isinstance(get_vision_llm(), DeepSeekProvider)
+
+    monkeypatch.setattr(config, "DEEPSEEK_API_KEY", None)
+    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
+        get_vision_llm()
+
+
 # ── Config credential validation ────────────────────────────────────────────
 
 

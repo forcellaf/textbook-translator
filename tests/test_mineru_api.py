@@ -39,11 +39,22 @@ def _make_pdf(path: Path, num_pages: int) -> None:
     doc.close()
 
 
-def _make_zip(markdown: str, images: dict[str, bytes] | None = None) -> bytes:
+def _make_zip(
+    markdown: str,
+    images: dict[str, bytes] | None = None,
+    content_list: list[dict] | None = None,
+) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("full.md", markdown)
         archive.writestr("layout.json", "{}")
+        if content_list is not None:
+            # Named as in a real archive (October 2026): a task uuid prefix,
+            # and a page-nested v2 file beside it that must not be picked.
+            uuid = "fabf55ca-5137-44c9-bb14-749daff53a1c"
+            archive.writestr(f"{uuid}_content_list.json", json.dumps(content_list))
+            archive.writestr(f"{uuid}_content_list_v2.json", json.dumps([[{"type": "v2"}]]))
+            archive.writestr(f"{uuid}_model.json", "[]")
         for name, blob in (images or {}).items():
             archive.writestr(f"images/{name}", blob)
     return buffer.getvalue()
@@ -66,8 +77,10 @@ class FakeAPI:
         submit_msg: str = "ok",
         err_msgs: dict[str, str] | None = None,
         upload_status: int = 200,
+        content_lists: dict[str, list[dict]] | None = None,
     ) -> None:
         self.markdown = markdown or {}
+        self.content_lists = content_lists or {}
         self.images = images or {}
         self.poll_states = poll_states
         self.submit_code = submit_code
@@ -98,7 +111,10 @@ class FakeAPI:
             return self._poll()
         if request.method == "GET" and "/results/" in url:
             name = url.split("/results/")[1].removesuffix(".zip")
-            return httpx.Response(200, content=_make_zip(self.markdown[name], self.images))
+            return httpx.Response(
+                200,
+                content=_make_zip(self.markdown[name], self.images, self.content_lists.get(name)),
+            )
 
         return httpx.Response(404, text=f"unexpected request: {request.method} {url}")
 
@@ -315,6 +331,39 @@ def test_parse_pdf_splits_uploads_polls_and_merges(tmp_path: Path) -> None:
     # content hash, so they cannot collide.
     assert (work_dir / "images" / "aaa.jpg").read_bytes() == b"\x89PNG-a"
     assert (work_dir / "images" / "bbb.jpg").read_bytes() == b"\x89PNG-b"
+
+
+def _block(kind: str, page: int, **extra: object) -> dict:
+    return {"type": kind, "bbox": [62, 100, 938, 160], "page_idx": page, **extra}
+
+
+def test_content_lists_are_kept_per_part_and_merged_with_global_pages(tmp_path: Path) -> None:
+    """Figures are sized from the layout data, so it must survive the merge,
+    with each part's page numbers made global (each part counts from 0)."""
+    pdf = tmp_path / "book.pdf"
+    _make_pdf(pdf, 400)
+    work_dir = tmp_path / "work"
+    api = FakeAPI(
+        markdown={name: "# x" for name in ("book_part_001", "book_part_002", "book_part_003")},
+        content_lists={
+            "book_part_001": [_block("text", 0, text="a"), _block("image", 3, img_path="images/a.jpg")],
+            "book_part_002": [_block("image", 0, img_path="images/b.jpg", image_caption=["图 12.1"])],
+            # Part 3's archive has no content list: not an error.
+        },
+    )
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        parse_pdf(pdf, work_dir, client=client)
+
+    assert (work_dir / "parts" / "book_part_001_content_list.json").exists()
+    assert not (work_dir / "parts" / "book_part_003_content_list.json").exists()
+    merged = json.loads((work_dir / "content_list.json").read_text(encoding="utf-8"))
+    manifest = json.loads((work_dir / "parts" / "manifest.json").read_text(encoding="utf-8"))
+    second_start = manifest["chunks"][1]["start_page"]
+    assert second_start > 1
+    assert [e.get("img_path") for e in merged] == [None, "images/a.jpg", "images/b.jpg"]
+    assert [e["page_idx"] for e in merged] == [0, 3, second_start - 1]
+    assert merged[2]["image_caption"] == ["图 12.1"]
 
 
 def test_small_pdf_is_sent_as_one_part(tmp_path: Path) -> None:

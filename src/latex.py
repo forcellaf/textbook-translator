@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 PREAMBLE_PATH: Path = ASSETS_DIR / "preamble.tex"
 SYSTEM_PROMPT_PATH: Path = ASSETS_DIR / "system_prompt_latex.txt"
 
+# A book whose first chapter differs from the shared preamble's
+# `\setcounter{chapter}` (a second volume starting at chapter 14) keeps its own
+# copy here, so building one book never renumbers another.
+KIT_PREAMBLE_NAME = "preamble.tex"
+
+
+def preamble_for(kit_dir: Path) -> Path:
+    """The preamble a kit builds against: ``<kit>/preamble.tex`` if the book
+    has one, else ``assets/preamble.tex``."""
+    own = kit_dir / KIT_PREAMBLE_NAME
+    return own if own.exists() else PREAMBLE_PATH
+
 # Where `profile_to_prompt_block` output goes in the prompt template.
 GLOSSARY_PLACEHOLDER = "{{BOOK_CONTEXT_AND_GLOSSARY}}"
 
@@ -413,6 +425,7 @@ __all__ = [
     "build_system_prompt",
     "find_preamble_leakage",
     "load_preamble",
+    "preamble_for",
     "preamble_first_chapter",
     "scan_environments",
     "validate_fragment",

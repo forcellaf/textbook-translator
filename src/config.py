@@ -98,6 +98,19 @@ DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
+# ── DeepSeek vision (figure classification, src.figures) ────────────────────
+# A separate model from DEEPSEEK_MODEL: the text model takes no image input,
+# so images are only ever sent to this one. Same key and base URL -- no
+# second credential. See https://api-docs.deepseek.com/guides/vision.
+DEEPSEEK_VISION_MODEL: str = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-flash")
+# Optional pause between vision calls, for an account with a low rate limit.
+# 429s are retried regardless; this only spaces the calls out up front.
+VISION_MIN_INTERVAL_SECONDS: float = float(os.getenv("VISION_MIN_INTERVAL_SECONDS", "0"))
+# An uncaptioned image is dropped only when the classifier calls it a
+# decoration with at least this confidence (and the numbering-gap guard
+# passes). Dropping a real figure is the expensive error, so this is high.
+FIGURE_DROP_CONFIDENCE: float = float(os.getenv("FIGURE_DROP_CONFIDENCE", "0.9"))
+
 # ── Provider credentials ────────────────────────────────────────────────────
 # Only the active provider's key is required. Validating every key would block
 # a DeepSeek-only user (the common case now) on a missing Gemini key they will

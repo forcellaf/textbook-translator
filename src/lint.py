@@ -49,12 +49,14 @@ from enum import Enum
 from pathlib import Path
 
 from src.config import SOURCE_RESIDUE_THRESHOLD
+from src.figures import FIGURES_NAME, load_figures, split_number
 from src.latex import (
     DEFINED_ENVIRONMENTS,
     brace_imbalance,
     find_preamble_leakage,
     load_preamble,
     preamble_first_chapter,
+    preamble_for,
     scan_environments,
 )
 from src.normalize import (
@@ -171,6 +173,7 @@ mathring not sb sp
 hline cline vline multicolumn multirow toprule midrule bottomrule
 mid nmid parallel shortmid AA SS aa ss textcircled textdegree textmu
 longmapsto hookrightarrow hookleftarrow rightsquigarrow between
+boxed xrightarrow xleftarrow therefore because dagger ddagger sqcap sqcup
 """.split()
 )
 
@@ -186,7 +189,7 @@ _STRUCTURE_COMMANDS: frozenset[str] = frozenset(
 chapter section subsection subsubsection paragraph subparagraph part
 caption label ref eqref item textbf textit texttt textrm emph underline
 centering raggedright raggedleft footnote textsuperscript textsubscript
-bookfig bookfigtwo includegraphics begin end
+bookfig bookfigtwo bookfigx bookfigtwox includegraphics begin end
 """.split()
 )
 
@@ -218,7 +221,7 @@ _NEVER_REPEATED_COMMANDS: frozenset[str] = frozenset(
     boldsymbol pmb operatorname text textbf textit textrm textsf texttt emph
     mbox chapter section subsection subsubsection paragraph subparagraph part
     caption label textsuperscript textsubscript centering bookfig bookfigtwo
-    includegraphics
+    bookfigx bookfigtwox includegraphics
     """.split()
 )
 
@@ -338,10 +341,20 @@ _COMMENT_RE = re.compile(r"(?<!\\)%[^\n]*")
 
 # Figure references in translated LaTeX: the \bookfig / \bookfigtwo macros
 # from assets/preamble.tex, plus a raw \includegraphics if the model used one.
+# \bookfigx / \bookfigtwox are what assembly rewrites those into, so an
+# assembled book is checked by the same function.
 _TEX_IMAGE_RES: tuple[tuple[re.Pattern[str], tuple[int, ...]], ...] = (
     (re.compile(r"\\includegraphics(?:\[[^\]]*\])?\s*\{([^{}]*)\}"), (1,)),
     (re.compile(r"\\bookfig(?:\[[^\]]*\])?\s*\{([^{}]*)\}"), (1,)),
     (re.compile(r"\\bookfigtwo\s*\{([^{}]*)\}\s*\{[^{}]*\}\s*\{([^{}]*)\}"), (1, 2)),
+    (re.compile(r"\\bookfigx\s*\{[^{}]*\}\s*\{([^{}]*)\}"), (1,)),
+    (
+        re.compile(
+            r"\\bookfigtwox\s*\{[^{}]*\}\s*\{([^{}]*)\}\s*\{[^{}]*\}"
+            r"\s*\{[^{}]*\}\s*\{([^{}]*)\}"
+        ),
+        (1, 2),
+    ),
 )
 
 # Truncation floor for a single chunk judged alone: a translation under 40%
@@ -1714,7 +1727,7 @@ def lint_kit(kit_dir: Path) -> LintReport:
 
     map_path = kit_dir / "image_map.json"
     try:
-        preamble: str | None = load_preamble()
+        preamble: str | None = load_preamble(preamble_for(kit_dir))
     except FileNotFoundError:
         preamble = None
 
@@ -1737,8 +1750,113 @@ def lint_kit(kit_dir: Path) -> LintReport:
 
     if map_path.exists():
         findings += _check_image_map(kit_dir, map_path, translations)
+        findings += _check_figures(kit_dir / FIGURES_NAME, map_path, translations)
 
     return LintReport(findings)
+
+
+def _check_figures(figures_path: Path, map_path: Path, translations: list[str]) -> list[Finding]:
+    """Figure records against the translation that will use them.
+
+    * A figure with no ``figures.json`` record is placed at the default
+      width with no number -- REVIEW, since it is either a stale file or an
+      image the figures step never saw.
+    * A dropped image still referenced is INFO: assembly removes it. For a
+      book prepared after the figures step it should not happen at all.
+    * Duplicate and missing figure numbers per chapter are INFO until they
+      have been measured on a real book: an uncalibrated check is noise.
+    """
+    if not figures_path.exists():
+        return [
+            Finding(
+                "figures",
+                Severity.INFO,
+                f"no {FIGURES_NAME}: figures keep the model's \\bookfig calls, numbered by "
+                "LaTeX's counter (run scripts/prepare_figures.py)",
+            )
+        ]
+    try:
+        token_to_path: dict[str, str] = json.loads(map_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []  # `_check_image_map` already reports this
+    records = load_figures(figures_path)
+
+    used = list(dict.fromkeys(IMG_TOKEN_RE.findall("\n".join(translations))))
+    no_record: list[str] = []
+    dropped: list[str] = []
+    numbered: list[tuple[str, str]] = []  # (number, token) in reading order
+    for digits in used:
+        token = f"IMG_{digits}"
+        path = token_to_path.get(token)
+        if path is None:
+            continue
+        record = records.get(Path(path).name)
+        if record is None:
+            no_record.append(token)
+        elif not record.keep:
+            dropped.append(token)
+        elif record.number:
+            numbered.append((record.number, token))
+
+    findings: list[Finding] = []
+    if no_record:
+        findings.append(
+            Finding(
+                "figures",
+                Severity.REVIEW,
+                f"{len(no_record)} figure(s) have no record in {FIGURES_NAME}; they will "
+                "be set at the default width with no number",
+                context=", ".join(no_record[:8]),
+            )
+        )
+    if dropped:
+        findings.append(
+            Finding(
+                "figures",
+                Severity.INFO,
+                f"{len(dropped)} dropped image(s) still appear in the translation; "
+                "assembly removes them",
+                context=", ".join(dropped[:8]),
+            )
+        )
+
+    by_chapter: dict[str, list[tuple[int, str, str]]] = {}
+    for number, token in numbered:
+        parsed = split_number(number)
+        if parsed:
+            by_chapter.setdefault(parsed[0], []).append((parsed[1], number, token))
+
+    duplicates: list[str] = []
+    gaps: list[str] = []
+    for chapter, entries in by_chapter.items():
+        seen: dict[int, str] = {}
+        for sequence, number, token in entries:
+            if sequence in seen:
+                duplicates.append(f"{number} ({seen[sequence]}, {token})")
+            else:
+                seen[sequence] = token
+        missing = sorted(set(range(1, max(seen) + 1)) - set(seen))
+        separator = entries[0][1][len(chapter)]  # "." in 18.3, "-" in A1.8-1
+        gaps += [f"{chapter}{separator}{m}" for m in missing]
+    if duplicates:
+        findings.append(
+            Finding(
+                "figure-numbers",
+                Severity.INFO,
+                f"{len(duplicates)} figure number(s) used twice in one chapter",
+                context=", ".join(duplicates[:_MAX_EXAMPLES]),
+            )
+        )
+    if gaps:
+        findings.append(
+            Finding(
+                "figure-numbers",
+                Severity.INFO,
+                f"{len(gaps)} figure number(s) missing from their chapter's sequence",
+                context=", ".join(gaps[:_MAX_EXAMPLES * 2]),
+            )
+        )
+    return findings
 
 
 def _restore_for_lint(text: str, map_path: Path) -> str:

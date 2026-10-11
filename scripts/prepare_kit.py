@@ -14,8 +14,11 @@ Stages, in order -- the order matters:
                  and follows up on conflicts. Headings become final \\part /
                  \\chapter / \\chapter* commands, so the translator never guesses
   5. tables      HTML -> pipe tables; warn and skip degenerate ones
-  6. tokenize    image paths -> IMG_nnnn
-  7. chunk       ~30,000 chars on paragraph boundaries
+  6. figures     kit/figures.json: each image's source number and width; DeepSeek
+                 vision labels the uncaptioned ones, and a confident decoration
+                 is dropped from the text before the translator sees it
+  7. tokenize    image paths -> IMG_nnnn
+  8. chunk       ~30,000 chars on paragraph boundaries
 
 Normalizing before profiling is not optional: headings are matched by their
 exact text, so classifying ``## 第13章`` and then merging it into
@@ -33,8 +36,17 @@ from pathlib import Path
 from _bootstrap import configure_logging  # noqa: E402  (must precede src imports)
 
 from src.config import KIT_CHUNK_CHARS  # noqa: E402
+from src.figures import (  # noqa: E402
+    FIGURES_NAME,
+    MODE_CLASSIFY,
+    MODE_DRY_RUN,
+    MODE_OFF,
+    figures_step,
+    strip_dropped_images,
+    write_review,
+)
 from src.kit import build_kit  # noqa: E402
-from src.latex import load_preamble, preamble_first_chapter  # noqa: E402
+from src.latex import load_preamble, preamble_first_chapter, preamble_for  # noqa: E402
 from src.normalize import normalize  # noqa: E402
 from src.profiler import apply_heading_levels, profile_book  # noqa: E402
 from src.structure import (  # noqa: E402
@@ -79,8 +91,27 @@ def main(argv: list[str] | None = None) -> int:
         help="also trim whitespace inside inline $ delimiters (off by default: the "
         "current parser produces none)",
     )
+    classify = parser.add_mutually_exclusive_group()
+    classify.add_argument(
+        "--no-classify",
+        action="store_true",
+        help="no vision calls: keep every uncaptioned image and list it for review",
+    )
+    classify.add_argument(
+        "--classify-dry-run",
+        action="store_true",
+        help="classify uncaptioned images and fill in the review sheet, but drop nothing",
+    )
+    parser.add_argument(
+        "--reclassify",
+        action="store_true",
+        help="ignore the labels cached in figures.json and ask the vision model again "
+        "(after a prompt or model change); manual entries are never touched",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if args.reclassify and args.no_classify:
+        parser.error("--reclassify needs the vision model; drop --no-classify")
 
     configure_logging(args.verbose)
 
@@ -143,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         llm=llm,
         cache_path=work_dir / STRUCTURE_FILENAME,
         force=args.force_structure,
-        first_chapter=preamble_first_chapter(load_preamble()),
+        first_chapter=preamble_first_chapter(load_preamble(preamble_for(work_dir / "kit"))),
     )
     kinds = report.counts()
     print(
@@ -169,10 +200,29 @@ def main(argv: list[str] | None = None) -> int:
         if not report.converted:
             print(f"  L{report.line:>6} table {report.index} left as HTML: {report.reason}")
 
+    # ── 6. figures ───────────────────────────────────────────────────────
+    kit_dir = args.kit_dir or (work_dir / "kit")
+    mode = (
+        MODE_OFF
+        if args.no_classify
+        else MODE_DRY_RUN
+        if args.classify_dry_run
+        else MODE_CLASSIFY
+    )
+    figures, note = figures_step(
+        text, work_dir=work_dir, kit_dir=kit_dir, mode=mode, reclassify=args.reclassify
+    )
+    print(f"\nfigures ({mode}): {figures.render()}")
+    if note:
+        print(f"  {note}")
+    text, removed = strip_dropped_images(text, figures.records)
+    if removed:
+        print(f"  removed {removed} dropped image reference(s) from the text")
+    print(f"  correct any of them in {kit_dir / FIGURES_NAME} (set \"by\": \"manual\")")
+
     (work_dir / PREPARED_NAME).write_text(text, encoding="utf-8")
 
-    # ── 6-7. tokenize + chunk ────────────────────────────────────────────
-    kit_dir = args.kit_dir or (work_dir / "kit")
+    # ── 7-8. tokenize + chunk ────────────────────────────────────────────
     kit = build_kit(
         text,
         kit_dir,
@@ -186,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         f"\nkit: {kit.chunk_count} chunk(s) of up to {budget:,} chars, "
         f"{len(kit.image_map)} image token(s) in {kit_dir}"
     )
+    review = write_review(kit_dir, figures.records, kit.image_map, figures.order)
+    print(f"  figure review sheet: {review}")
     print(f"  paste {kit_dir / 'system_prompt.txt'} as the system prompt")
     print(f"  send  {kit_dir / 'chunks'}/NNN.md one at a time, one fresh conversation each")
     print(f"  save each reply (LaTeX) to {kit_dir / 'translated'}/NNN.tex")

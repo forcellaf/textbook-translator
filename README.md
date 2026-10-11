@@ -59,11 +59,12 @@ Each book gets its own work directory, so several coexist in one checkout:
 
 ```
 data/work/<book_name>/
-├── parts/              part PDFs sent to the API (+ manifest.json)
+├── parts/              part PDFs sent to the API (+ manifest.json, per-part content lists)
 ├── images/             every figure, flat, named by content hash
 ├── merged.md           raw parser output          ← stage 1
+├── content_list.json   MinerU's layout: every block's bbox and page ← stage 1
 ├── normalized.md       after split-heading repair ← stage 2
-├── prepared.md         after re-levelling, structure + tables
+├── prepared.md         after re-levelling, structure, tables + figures
 ├── book_profile.json   cached LLM call: glossary + heading levels
 ├── structure.json      part / chapter / reading per top-level heading (hand-editable)
 └── kit/
@@ -71,6 +72,8 @@ data/work/<book_name>/
     ├── translated/001.tex…  your saved replies (you fill this in)
     ├── images/
     ├── image_map.json       IMG_nnnn → real filename
+    ├── figures.json         number / width / keep per image (hand-editable)
+    ├── figures_review.html  dropped, flagged and default-width figures, as thumbnails
     ├── source_clean.md
     ├── system_prompt.txt
     ├── translated_book.tex  ← stage 4 assembles this
@@ -92,7 +95,9 @@ uv run python scripts/parse_book.py data/input/physics.pdf data/work/physics
 
 Splits the PDF to fit the API's hard limits (200 pages / 200 MB per file),
 uploads every part in one batch, polls with per-file page progress, and merges
-the results into `merged.md` plus a flat `images/`.
+the results into `merged.md` plus a flat `images/`. Each part's layout data
+is kept too and merged into `content_list.json`, page numbers made global;
+it is what sizes the figures in stage 2.
 
 | Flag | Purpose |
 |---|---|
@@ -121,7 +126,7 @@ complete one.
 uv run python scripts/prepare_kit.py data/work/physics
 ```
 
-Seven steps, in this order:
+Eight steps, in this order:
 
 1. **normalize** — merge split headings; report anything else short
 2. **profile** — one cached LLM call: glossary + a level per heading
@@ -130,14 +135,20 @@ Seven steps, in this order:
    supplementary readings, and write them as final `\part` / `\chapter` /
    `\chapter*` (see below)
 5. **tables** — HTML → markdown pipe tables
-6. **tokenize** — image paths → `IMG_nnnn`
-7. **chunk** — ~30,000 chars, on paragraph boundaries only
+6. **figures** — `kit/figures.json`: each image's source number and width;
+   uncaptioned images are classified, and a confident decoration is removed
+   before the translator sees it (see below)
+7. **tokenize** — image paths → `IMG_nnnn`
+8. **chunk** — ~30,000 chars, on paragraph boundaries only
 
 | Flag | Purpose |
 |---|---|
 | `--no-profile` | Skip the LLM calls; headings keep their parsed levels, and structure uses the numbering rules only |
 | `--force-profile` | Ignore the cached profile |
 | `--force-structure` | Ask DeepSeek again about headings it already decided |
+| `--no-classify` | No vision calls: keep every uncaptioned image and list it for review |
+| `--classify-dry-run` | Classify and fill in the review sheet, but drop nothing |
+| `--reclassify` | Ignore the labels cached in `figures.json` and ask the vision model again |
 | `--chunk-chars N` | Override the chunk budget |
 | `--fix-math-spacing` | Trim whitespace inside inline `$` (see below) |
 | `-v` | Also list every short heading left unchanged |
@@ -189,7 +200,74 @@ The step also turns numbered items under a chapter summary (提要), which the
 parser made into headings, back into paragraphs, and stars the sections of a
 reading — a numbered `\section` inside `\chapter*` would be numbered from the
 chapter before it. It warns if the book's first chapter does not match
-`\setcounter{chapter}` in `assets/preamble.tex`.
+`\setcounter{chapter}` in the book's preamble (`kit/preamble.tex` if the book
+has one, else `assets/preamble.tex`).
+
+**Figures.** Each image's number, width and whether it is a figure at all are
+decided here, outside the translating model, and stored per image filename in
+`kit/figures.json`. The model only copies `IMG_nnnn` tokens; assembly applies
+the records at build time, so a wrong width, number or drop is fixed by
+editing one line and rebuilding — no re-translation.
+
+- **Number** — from MinerU's `image_caption`, else the caption line under the
+  image (`图 18.3`, `图18.3`, `图 G.2`). The PDF prints exactly that number;
+  LaTeX's own figure counter is never shown. It used to be: a decorative
+  chapter glyph became "Figure 18.1" and every later figure in the chapter was
+  one off from the prose citing it. An uncaptioned figure gets no caption.
+  The panels of a figure — `(a)` / `(b)` images under one caption — share its
+  number.
+- **Width** — the image's bbox width over the median width of the book's long
+  body-text blocks, clamped to 0.20–0.90 of `\textwidth`. Only the width comes
+  from the bbox; the aspect ratio comes from the image, and every figure is
+  also capped at 0.45 `\textheight`. No bbox → 0.6, listed for review.
+- **Keep** — only uncaptioned images are candidates. Each one is sent to
+  DeepSeek's vision model (`DEEPSEEK_VISION_MODEL`, same key) with the text
+  around it, and is dropped only if it comes back as a `decoration` with
+  confidence ≥ 0.9 **and** it does not sit in a gap in the caption numbering
+  (an uncaptioned image between 18.3 and 18.5 is probably 18.4 with its
+  caption lost). Everything else — a low confidence, another label, a
+  malformed reply, an API failure — keeps the image and flags it. A kept
+  decoration costs one wasted figure; a dropped figure is missing content.
+
+On the reference book, 542 of 780 images take their number from a caption and
+99 are panels of a captioned figure, leaving 139 candidates, 59 of them inside
+a numbering gap. Checked by hand, 22 of the 139 are not figures: 9 chapter
+drop caps, 12 pencil icons marking summary/exercise sections, and a 习题
+banner. The classifier drops 17 of them and no real figure. Of the other
+five, two drop caps are held back by the numbering-gap guard and three blurry
+icons come back below the threshold — kept, flagged, and dropped by hand.
+Confidence is coarse (the model answers 0.6, 0.9 or 0.97), so moving the
+threshold changes a lot at once.
+
+**Run the first book with `--classify-dry-run`**, which labels everything and
+drops nothing, then open `kit/figures_review.html`: every dropped, flagged and
+default-width image as a thumbnail with the classifier's label and reason,
+dropped first. Labels are cached in `figures.json`, so the real run that
+follows makes no new calls. To overrule any decision, edit the entry and set
+its `"by"` to `"manual"`; manual entries are never overwritten. After
+changing the classifier prompt in [src/figures.py](src/figures.py) or the
+model, pass `--reclassify` to discard the cached labels and ask again.
+
+**A book prepared before this step** (physics_2) needs no re-translation:
+
+```bash
+uv run python scripts/prepare_figures.py data/work/physics_2_pipeline --classify-dry-run
+```
+
+builds `figures.json` from the existing chunks and `image_map.json` without
+touching `merged.md`, the chunks or the translations; dropped figures are
+removed at assembly. It has no layout data, so every width is the default
+until the PDF is re-parsed **into a separate work directory** and linked:
+
+```bash
+uv run python scripts/parse_book.py data/input/physics_2_pipeline.pdf data/work/physics_2_reparse
+uv run python scripts/link_figures.py data/work/physics_2_pipeline data/work/physics_2_reparse
+```
+
+A re-parse may crop images differently, so linking matches the exact filename
+first, then a difference hash near the same reading-order position, and
+prints the counts by method. Unmatched images keep the default width and show
+up in the review sheet.
 
 **Then translate.** Paste `kit/system_prompt.txt` as the system instruction,
 send `kit/chunks/001.md` … one at a time in a fresh conversation each, and save
@@ -247,6 +325,12 @@ commands, unknown command tokens, text-mode commands inside math
 (`\multirow`), chapter numbers that drift from the book's own equation tags,
 and figure paths that do not resolve on disk.
 
+Against `figures.json`: a figure with no record (review); a dropped image the
+translation still references (info — assembly removes it); and per chapter,
+figure numbers used twice or missing from the sequence (info). The numbering
+checks stay informational until calibrated: on the reference book they find 1
+duplicate and 66 missing numbers, nearly all captions the parser lost.
+
 **Every one of those LaTeX checks was a real failure during testing, and none
 of them is visible by reading the file** — the output looks correct and only
 fails at compile time, one error per compile. The undefined-environment check
@@ -282,7 +366,9 @@ fragment) or `--markdown merged.md` (the parsed source).
 uv run python scripts/build_pdf.py data/work/physics/kit
 ```
 
-Lints the kit, concatenates the saved LaTeX replies, restores the real image
+Lints the kit, concatenates the saved LaTeX replies, rewrites every
+`\bookfig` / `\bookfigtwo` from `figures.json` (width, source number, dropped
+figures removed; a width the model wrote is ignored), restores the real image
 filenames from `image_map.json`, wraps the result in
 [assets/preamble.tex](assets/preamble.tex), and runs `pdflatex` twice — the
 second pass is what fills in the table of contents.
@@ -310,11 +396,17 @@ two-line swap to `fontspec` + `xeCJK` — uncomment it and pass
 
 The preamble is a verified configuration, hand-maintained, and the
 specification rather than an output of the code: `openany` removes the blank
-verso before every chapter, `\bookfig` caps figure width (MinerU images carry
-no usable intrinsic size, so without it every figure renders wider than the
-text block), and `\setcounter{chapter}{11}` is what makes a volume starting at
-chapter 12 number its sections `12.1`, `12.2` … instead of `1.1`, `1.2`. Set
-that to (first chapter number − 1) for a different volume.
+verso before every chapter, `\bookfigx` / `\bookfigtwox` size each figure
+from `figures.json` and cap its height (MinerU images carry no usable
+intrinsic size, so without an explicit width every figure renders wider than
+the text block, and without a height cap a tall one runs off the page), and `\setcounter{chapter}{N}` is what makes a volume starting at
+chapter N+1 number its sections `12.1`, `12.2` … instead of `1.1`, `1.2`.
+
+The shared preamble starts at chapter 1. A book that starts elsewhere (a second
+volume beginning at chapter 14) gets its own copy as `kit/preamble.tex` with
+only the counter changed; assembly, lint and prepare use it whenever it exists,
+so building one book never renumbers another. The copy does not follow later
+edits to `assets/preamble.tex` -- re-copy it after changing the shared one.
 
 A compile failure is printed as the error lines pulled out of the log, not the
 log itself, and the script exits non-zero.
@@ -345,6 +437,9 @@ All settings are environment variables, read in [src/config.py](src/config.py).
 | `SOURCE_RESIDUE_THRESHOLD` | `0.04` | CJK fraction above which a chunk reads as untranslated |
 | `SPLIT_MAX_PAGES` | `190` | Per-part page target (API hard limit 200) |
 | `SPLIT_MAX_SIZE_MB` | `180` | Per-part size target (API hard limit 200) |
+| `DEEPSEEK_VISION_MODEL` | `deepseek-flash` | Figure classifier; the only model images are sent to. Uses `DEEPSEEK_API_KEY` |
+| `FIGURE_DROP_CONFIDENCE` | `0.9` | A decoration is dropped only at or above this confidence |
+| `VISION_MIN_INTERVAL_SECONDS` | `0` | Pause between vision calls, for a low rate limit |
 
 `HTTP_PROXY` / `HTTPS_PROXY` are honoured if set — MinerU's storage sits behind
 Aliyun OSS, which is slow from some networks.
@@ -373,6 +468,9 @@ What genuinely still needs handling, and which stage handles it:
 | Split headings (`## 第13章` / `## 电势`) | prepare → normalize |
 | Tables emitted as raw HTML, which the model reproduces as HTML | prepare → tables |
 | Model corrupting 64-char image hashes (~7.7%) | prepare → tokenize |
+| Every figure the same width; tall ones overflowing the page | prepare → figures, build |
+| Figure numbers shifted by uncaptioned images taking a counter value | prepare → figures, build |
+| Decorations and text-as-image extracted as figures | prepare → figures |
 
 Display math is still character-spaced. That is **cosmetic only** — with no
 delimiter-adjacent whitespace it compiles correctly. Don't "fix" it.
@@ -416,8 +514,10 @@ untranslated chunk is *full length* and correctly formatted. Re-send that chunk.
 DEEPSEEK_API_KEY=fake uv run python -m pytest tests/ -q
 ```
 
-The suite makes **no real API calls**: LLMs are fakes implementing `BaseLLM`,
-and MinerU is served by an `httpx.MockTransport`. Fixtures are built from real
+The suite makes **no real API calls**: LLMs are fakes implementing `BaseLLM`
+(the figure classifier a fake `VisionLLM`), and MinerU is served by an
+`httpx.MockTransport`. If `pdflatex` is installed, one test compiles the real
+preamble's figure macros and checks the printed numbers. Fixtures are built from real
 defect signatures, so each fails without its fix — including negative fixtures
 proving that `提要` and `习题` (19 legitimate occurrences each) are never
 merged, and that the historical defects are still *detected* even though
@@ -431,6 +531,7 @@ nothing repairs them any more.
 | [src/latex.py](src/latex.py) | Preamble + prompt assets, fragment scanning, assembly |
 | [src/profiler.py](src/profiler.py) | Cached per-book LLM call: glossary + heading levels |
 | [src/structure.py](src/structure.py) | Parts / chapters / readings from the numbering; DeepSeek for the rest |
+| [src/figures.py](src/figures.py) | Figure numbers, widths and drops (`figures.json`), vision classifier, re-parse linking |
 | [src/kit.py](src/kit.py) | Tokenising, chunking, assembly, packaging |
 | [src/lint.py](src/lint.py) | Every check, in one pass |
 | [src/build.py](src/build.py) | `pdflatex` invocation |

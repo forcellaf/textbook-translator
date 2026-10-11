@@ -648,7 +648,7 @@ def analyze_structure(
         report.warnings.append(
             f"the book's first chapter is {numbered[0]} but the preamble starts at "
             f"{first_chapter}: set \\setcounter{{chapter}}{{{numbered[0] - 1}}} in "
-            "assets/preamble.tex"
+            "a copy of assets/preamble.tex saved as kit/preamble.tex"
         )
 
     if cache_path is not None:

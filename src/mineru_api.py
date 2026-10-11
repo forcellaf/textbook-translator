@@ -46,6 +46,7 @@ anything is uploaded.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import time
 import zipfile
@@ -63,6 +64,10 @@ logger = logging.getLogger(__name__)
 MERGED_NAME = "merged.md"
 IMAGES_DIRNAME = "images"
 PARTS_DIRNAME = "parts"
+# MinerU's layout data: one entry per block, with its bbox and page. Figures
+# are sized from it (src.figures), so it is kept per part and merged per book.
+CONTENT_LIST_NAME = "content_list.json"
+PART_CONTENT_LIST_SUFFIX = "_content_list.json"
 
 # Hard API limits. `config.SPLIT_MAX_PAGES` / `SPLIT_MAX_SIZE_MB` are the
 # (lower) targets we actually split to; these are the ceilings the service
@@ -325,12 +330,15 @@ class MinerUClient:
 
     # ── Download ─────────────────────────────────────────────────────────
 
-    def download_part(self, entry: dict, images_dir: Path) -> str:
+    def download_part(
+        self, entry: dict, images_dir: Path, content_list_path: Path | None = None
+    ) -> str:
         """Download one part's result ZIP; return its markdown and extract its
         images into the shared flat ``images_dir``.
 
         Image filenames are content hashes, so they are unique across parts
-        and share one directory without collision.
+        and share one directory without collision. The part's content list,
+        when the archive has one, is written to ``content_list_path``.
         """
         url = entry.get("full_zip_url")
         if not url:
@@ -340,7 +348,9 @@ class MinerUClient:
 
         response = self._storage.get(url, timeout=1800.0, follow_redirects=True)
         response.raise_for_status()
-        return _unpack_zip(response.content, images_dir, entry.get("file_name", "?"))
+        return _unpack_zip(
+            response.content, images_dir, entry.get("file_name", "?"), content_list_path
+        )
 
     # ── Internals ────────────────────────────────────────────────────────
 
@@ -396,8 +406,15 @@ def _progress_line(results: list[dict]) -> str:
     return " | ".join(fields)
 
 
-def _unpack_zip(blob: bytes, images_dir: Path, label: str) -> str:
-    """Pull the markdown out of a result archive and flatten its images."""
+def _unpack_zip(
+    blob: bytes, images_dir: Path, label: str, content_list_path: Path | None = None
+) -> str:
+    """Pull the markdown out of a result archive and flatten its images.
+
+    With ``content_list_path``, the archive's ``<name>_content_list.json`` is
+    written there too. An archive without one is not an error: figures then
+    fall back to a default width.
+    """
     with zipfile.ZipFile(io.BytesIO(blob)) as archive:
         names = archive.namelist()
         md_names = [n for n in names if n.lower().endswith(".md")]
@@ -415,7 +432,60 @@ def _unpack_zip(blob: bytes, images_dir: Path, label: str) -> str:
             if not target.exists():
                 target.write_bytes(archive.read(name))
 
+        if content_list_path is not None:
+            chosen_list = _content_list_member(names)
+            if chosen_list is None:
+                logger.warning("Result archive for %s has no content list", label)
+            else:
+                content_list_path.parent.mkdir(parents=True, exist_ok=True)
+                content_list_path.write_bytes(archive.read(chosen_list))
+
     return markdown
+
+
+def _content_list_member(names: list[str]) -> str | None:
+    """The archive member holding the flat content list.
+
+    ``<name>_content_list.json`` is the documented one. Newer archives also
+    carry a ``content_list_v2.json`` in a different, page-nested schema, which
+    is not what ``src.figures`` reads.
+    """
+    candidates = [n for n in names if n.endswith(PART_CONTENT_LIST_SUFFIX)]
+    if not candidates:
+        candidates = [n for n in names if Path(n).name == CONTENT_LIST_NAME]
+    return candidates[0] if candidates else None
+
+
+def merge_content_lists(parts: list[tuple[Path, int]], out_path: Path) -> int:
+    """Concatenate per-part content lists into one book-level list.
+
+    ``parts`` is ``(part_content_list, first_page)`` in document order, with
+    ``first_page`` 1-based in the original PDF. Each part is parsed alone, so
+    its ``page_idx`` counts from 0; it is offset here to be global. A part
+    whose list is missing or unreadable is skipped with a warning. Returns
+    the number of entries written.
+    """
+    merged: list[dict] = []
+    for path, first_page in parts:
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Skipping content list %s: %s", path, exc)
+            continue
+        if not isinstance(entries, list):
+            logger.warning("Skipping content list %s: not a list", path)
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry = dict(entry)
+            if isinstance(entry.get("page_idx"), int):
+                entry["page_idx"] += first_page - 1
+            merged.append(entry)
+    out_path.write_text(
+        json.dumps(merged, ensure_ascii=False, indent=1) + "\n", encoding="utf-8", newline="\n"
+    )
+    return len(merged)
 
 
 def _page_count(pdf_path: Path) -> int:
@@ -512,6 +582,7 @@ def parse_pdf(
 
         by_name = {entry.get("file_name"): entry for entry in results}
         sections: list[str] = []
+        content_lists: list[tuple[Path, int]] = []
         part_results: list[PartResult] = []
 
         for chunk in split.chunks:
@@ -531,7 +602,12 @@ def parse_pdf(
                 logger.error("Part %s %s: %s", name, state, err)
                 continue
 
-            sections.append(client.download_part(entry, images_dir))
+            content_list = (
+                work_dir / PARTS_DIRNAME / f"{chunk.output_path.stem}{PART_CONTENT_LIST_SUFFIX}"
+            )
+            sections.append(client.download_part(entry, images_dir, content_list))
+            if content_list.exists():
+                content_lists.append((content_list, chunk.start_page))
             part_results.append(
                 PartResult(chunk.index, name, state, pages=chunk.page_count)
             )
@@ -547,6 +623,9 @@ def parse_pdf(
 
     work_dir.mkdir(parents=True, exist_ok=True)
     merged_path.write_text("\n\n".join(s.strip("\n") for s in sections) + "\n", encoding="utf-8")
+    if content_lists:
+        count = merge_content_lists(content_lists, work_dir / CONTENT_LIST_NAME)
+        logger.info("Wrote %s (%d layout entries)", work_dir / CONTENT_LIST_NAME, count)
 
     text_len = len(merged_path.read_text(encoding="utf-8"))
     n_images = sum(1 for _ in images_dir.iterdir()) if images_dir.exists() else 0
@@ -573,10 +652,12 @@ def parse_pdf(
 __all__ = [
     "API_MAX_FILE_MB",
     "API_MAX_PAGES_PER_FILE",
+    "CONTENT_LIST_NAME",
     "MERGED_NAME",
     "MinerUClient",
     "MinerUError",
     "ParseResult",
     "PartResult",
+    "merge_content_lists",
     "parse_pdf",
 ]
