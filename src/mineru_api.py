@@ -67,6 +67,7 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src import config
+from src.footnotes import FootnoteReport, restore_footnotes
 from src.splitter import split_pdf
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,8 @@ class ParseResult:
     work_dir: Path
     total_pages: int
     parts: tuple[PartResult, ...]
+    # What src.footnotes put back; None without a content list (or a skipped parse).
+    footnotes: FootnoteReport | None = None
 
     @property
     def failed_parts(self) -> tuple[PartResult, ...]:
@@ -541,7 +544,9 @@ def parse_pdf(
 ) -> ParseResult:
     """Parse ``pdf_path`` with the MinerU cloud API into ``work_dir``.
 
-    Writes ``work_dir/merged.md`` (all parts concatenated, in document order)
+    Writes ``work_dir/merged.md`` (all parts concatenated, in document order,
+    with the ``page_footnote`` blocks MinerU's markdown leaves out restored
+    from the content list -- see ``src.footnotes``), ``work_dir/content_list.json``
     and ``work_dir/images/`` (flat, shared by every part). Part PDFs land in
     ``work_dir/parts/``.
 
@@ -690,10 +695,19 @@ def parse_pdf(
         )
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    merged_path.write_text("\n\n".join(s.strip("\n") for s in sections) + "\n", encoding="utf-8")
+    merged_text = "\n\n".join(s.strip("\n") for s in sections) + "\n"
+    footnotes: FootnoteReport | None = None
     if content_lists:
-        count = merge_content_lists(content_lists, work_dir / CONTENT_LIST_NAME)
-        logger.info("Wrote %s (%d layout entries)", work_dir / CONTENT_LIST_NAME, count)
+        content_list_path = work_dir / CONTENT_LIST_NAME
+        count = merge_content_lists(content_lists, content_list_path)
+        logger.info("Wrote %s (%d layout entries)", content_list_path, count)
+        # full.md leaves out page_footnote blocks; put them back from the
+        # layout data (see src.footnotes).
+        entries = json.loads(content_list_path.read_text(encoding="utf-8"))
+        merged_text, footnotes = restore_footnotes(merged_text, entries)
+        if footnotes.footnote_blocks:
+            logger.info("Footnotes: %s", footnotes.summary())
+    merged_path.write_text(merged_text, encoding="utf-8")
 
     record = _load_record(record_path) or {}
     record.update(
@@ -713,6 +727,7 @@ def parse_pdf(
         work_dir=work_dir,
         total_pages=total_pages,
         parts=tuple(part_results),
+        footnotes=footnotes,
     )
     for failed in result.failed_parts:
         logger.warning(

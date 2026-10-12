@@ -367,6 +367,32 @@ def test_content_lists_are_kept_per_part_and_merged_with_global_pages(tmp_path: 
     assert merged[2]["image_caption"] == ["图 12.1"]
 
 
+def test_page_footnotes_dropped_from_full_md_are_restored_into_merged_md(tmp_path: Path) -> None:
+    """full.md leaves page_footnote blocks out; parse_pdf puts them back
+    from the content list, after the paragraph holding the marker."""
+    pdf = tmp_path / "small.pdf"
+    _make_pdf(pdf, 2)
+    work_dir = tmp_path / "work"
+    api = FakeAPI(
+        markdown={"small_part_001": "正文带有标记①的段落。\n\n下一页的正文。"},
+        content_lists={
+            "small_part_001": [
+                _block("text", 0, text="正文带有标记①的段落。"),
+                {**_block("page_footnote", 0, text="①脚注的文字。"), "bbox": [62, 880, 938, 900]},
+                _block("text", 1, text="下一页的正文。"),
+            ]
+        },
+    )
+
+    with MinerUClient(token="tok", transport=api.transport()) as client:
+        result = parse_pdf(pdf, work_dir, client=client)
+
+    assert result.merged_path.read_text(encoding="utf-8") == (
+        "正文带有标记①的段落。\n\n① 脚注的文字。\n\n下一页的正文。\n"
+    )
+    assert result.footnotes is not None and result.footnotes.at_marker == 1
+
+
 def test_small_pdf_is_sent_as_one_part(tmp_path: Path) -> None:
     pdf = tmp_path / "small.pdf"
     _make_pdf(pdf, 5)

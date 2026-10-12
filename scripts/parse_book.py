@@ -168,11 +168,15 @@ def main(argv: list[str] | None = None) -> int:
     summary.update(_parsed_summary(work_dir))
     summary["pages_parsed"] = result.total_pages
     summary["quota_pages_per_day"] = config.MINERU_DAILY_PAGE_QUOTA
+    if result.footnotes is not None:
+        summary["footnotes"] = result.footnotes.as_dict()
 
     if not args.json:
         print(f"\nwrote {result.merged_path}")
         print(f"      {result.images_dir}")
         print(f"      {result.total_pages} page(s) parsed")
+        if result.footnotes is not None and result.footnotes.footnote_blocks:
+            print(f"      footnotes: {result.footnotes.summary()}")
         if summary.get("first_heading_warning"):
             print(f"\nWARNING: {summary['first_heading_warning']}")
 

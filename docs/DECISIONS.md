@@ -281,3 +281,37 @@ status`: loggedIn false) and reported `claude-opus-5-5` as unrecognised
 (v2.1.251). The orchestration was performed in an interactive session
 following SKILL.md instead, with generic subagents given the agent files'
 text, because that session predated `.claude/agents/`.
+
+## Footnotes restored from the content list
+
+**MinerU's `full.md` drops `page_footnote` blocks**, as it drops running
+heads and page numbers, and `merged.md` is `full.md` concatenated. On
+physics_2 that lost 109 blocks: ~58 real footnotes (their ① markers
+survived), body text the VLM mis-tagged as a footnote (the statements of
+Examples 13.3 and 30.2), and footnote derivations whose `equation` blocks
+stayed stranded in the body. That run fixed it with a per-book script;
+`src.footnotes` now does the same in `parse_pdf`, right after the content
+lists are merged.
+
+**Placement follows the physics_2 fix.** A page's footnote region is every
+non-furniture entry at or below its first `page_footnote`'s top. It is
+grouped at circled markers. A marked footnote goes in as an `① text`
+paragraph after the paragraph holding the marker, which the system prompt
+already turns into `\footnote{}`. Its display equations are moved out of the
+body into it, joined by single newlines so the footnote stays one paragraph.
+Unmarked text goes in as body after the block above it.
+
+**Only `page_footnote` blocks open a footnote.** A `text` block in the region
+that starts with ① is a body enumeration far more often than a footnote. Any
+non-footnote, non-equation block ends the current footnote and stays where
+it is.
+
+**Markers split a block only at its start, a line start or after 。** —
+"由①式" refers to an equation.
+
+**Entries are matched to paragraphs by text, in reading order**
+(whitespace-free), not by page breaks, which `merged.md` does not have.
+Text already present is skipped, so a restore is idempotent and leaves a
+book restored by hand as it is. `scripts/restore_footnotes.py` applies it
+to a book parsed earlier without re-parsing (report by default, `--write`
+to change `merged.md`, with a backup).
