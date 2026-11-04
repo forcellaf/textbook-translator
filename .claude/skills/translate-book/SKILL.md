@@ -19,6 +19,10 @@ lowercased, with spaces turned into `_`. Work dir: `data/work/<book_name>/`.
 
 - **Delegate model work.**
   - Chunk translation goes to `chunk-translator`.
+  - Meaning verification goes to `chunk-verifier` (one per chunk) and
+    `page-verifier` (one per chunk with flagged equations).
+  - Figures with Chinese text inside go to `diagram-translator`, one per
+    image.
   - Exchange requests go to `llm-answerer-sonnet` (roles `profile` and
     `structure`) or `figure-classifier` (role `classify`).
   - Any output longer than ~150 lines (lint reports, build logs, parse
@@ -36,7 +40,9 @@ lowercased, with spaces turned into `_`. Work dir: `data/work/<book_name>/`.
 - **Never change the tool mid-run.** No edits to `src/`, `assets/` or
   `tests/`. Per-book adjustments go in the work dir: `structure.json`,
   `figures.json`, `book_profile.json` with `"by": "agent"`,
-  `kit/known_commands.txt`, `kit/lint_waivers.json`, `kit/translated/*.tex`.
+  `kit/known_commands.txt`, `kit/lint_waivers.json`, `kit/translated/*.tex`,
+  `kit/verify/`, `kit/figure_text/`, and `kit/chunks/*.md` (only for a
+  parse error a page verifier confirmed against the page image).
 - **Record every state change** with `uv run python scripts/run_state.py`, so
   a crashed run resumes where it stopped.
 - **Prefer JSON summaries.** Pass `--json` to scripts and read the summary
@@ -158,6 +164,11 @@ the English cover page (`book_meta.json`, typeset at assembly).
        content. When unsure, keep it and log it.
    - **Tables left as HTML:** accept them (merged cells are legitimate) and
      log the count.
+   - **Chinese text in figures:** the classifier also answers, for every
+     kept image (captioned ones too), whether Chinese text is printed inside
+     it (`chinese_text` in `figures.json`). Log the count; the images are
+     handled in step 4c. When you overrule a record, keep its
+     `chinese_text`.
 3. **Real run:** spawn `stage2-preparer` again with
    `uv run python scripts/prepare_kit.py data/work/<book> --json`. Cached
    labels mean no new requests. Confirm the chunk count.
@@ -204,6 +215,80 @@ the English cover page (`book_meta.json`, typeset at assembly).
    lint rounds pass without progress. In that case, log what remains and
    continue to the build anyway.
 
+## Step 4b — Verify meaning
+
+Lint compares the mathematics token by token; nothing so far has read the
+prose. A stronger model now reads every chunk against its source. This step
+is **reported in the log, never a gate**: a finding left unfixed does not
+stop the build.
+
+1. **Chunk verifiers:** `run_state.py ... set stage verify`, `mkdir -p
+   <kit>/verify`, then run
+   `uv run python scripts/verify_kit.py <kit> report --json` and spawn one
+   `chunk-verifier` per chunk in `unverified`, at most 10 at a time. Give
+   each only the kit path and the chunk number. Each fixes prose problems in
+   `translated/NNN.tex` itself, flags major equation problems as
+   `page-check`, writes `verify/NNN.json`, and returns
+   `NNN ok <n> findings, <f> fixed, <p> page-check`.
+2. **Page checks:** if any verifier reported a page check, run
+   `uv run python scripts/verify_kit.py <kit> pages --json`. It finds each
+   flagged passage's page through MinerU's layout data and renders it to
+   `verify/pages/`. Spawn one `page-verifier` per chunk in its `chunks`
+   (kit path and chunk number only), at most 10 at a time. It reads the
+   page image, decides `translation-error` / `parse-error` / `no-error` /
+   `unresolved`, fixes the translation (and, for a parse error, the source
+   chunk) in place, and writes `verify/NNN.pages.json`. A task with no
+   image (`note`) still goes to the page verifier, which returns
+   `unresolved`; log it.
+3. **Report:** run `verify_kit.py <kit> report --json` again (through
+   `output-digester` if it is long). Exit code 1 means a result file is
+   malformed (`problems`): delete it and re-spawn that agent once, quoting
+   the problem; a second failure is logged as "chunk NNN not verified".
+   `page_checks_pending` must be empty, or each one logged.
+   - Copy into the log: every `fixed` item under Decisions (location,
+     kind, before → after); every `left` item and every `unresolved` page
+     check under Uncertainties; every confirmed `parse-error` into the
+     spot-check list with its page. A finding with `flags` could not be
+     confirmed against the files: say so beside it.
+4. **Re-lint once.** The verifiers edited LaTeX; run step 4's lint with
+   `--fix` and repair anything they broke, as in step 4. Do not
+   re-translate a verified chunk (that would discard the verifiers' fixes).
+   If you must, delete its `verify/NNN.json` and `verify/NNN.pages.json`
+   first and verify it again.
+
+## Step 4c — Translate the text inside figures
+
+The translation never touches a figure: a scanned diagram keeps its Chinese
+labels unless it is redrawn or relabelled. This runs after the text is
+final, so the labels can use the translation's own terms.
+
+1. **Tasks:** `run_state.py ... set stage figure-text`, then
+   `uv run python scripts/figure_text.py <kit> tasks --json`.
+   - `todo`: the images to do. Nothing to do: go to step 5.
+   - `not_asked`: kept images never asked about Chinese text (protected
+     records, failed calls). Look at up to 10 of them yourself (Read the
+     image); set `"chinese_text": true` or `false` in `figures.json` for
+     each, and run `tasks` again. Log any more than 10 as an uncertainty.
+2. **Translate:** spawn one `diagram-translator` per stem in `todo`, at most
+   8 at a time, giving each only the kit path and the stem. It chooses a
+   TikZ redraw, an English overlay on the scan, or an English legend under
+   it, renders, checks its preview against the original, and accepts it.
+   It returns `<stem> ok <method>` or `<stem> failed: <reason>`. Re-spawn a
+   failed one once only if the reason is not about the figure itself (it
+   was interrupted, a file was missing).
+3. **Report:** `uv run python scripts/figure_text.py <kit> report --json`
+   (through `output-digester` if long).
+   - Log each `done` figure under Decisions: figure number, method, number
+     of labels.
+   - Log each `not_done` figure under Uncertainties: it keeps its Chinese
+     labels in the PDF (the original scan is used). Put the first few in the
+     spot-check list, and every `tikz` figure too: a redraw can change a
+     diagram.
+   - Do not edit the specs or `.tex` yourself; an accepted spec changed
+     after its render is not used.
+
+The build picks the English PDFs up from `kit/figure_text/` by itself.
+
 ## Step 5 — Build
 
 1. **Build:** run `uv run python scripts/build_pdf.py <kit> --json`, which
@@ -241,7 +326,10 @@ the English cover page (`book_meta.json`, typeset at assembly).
     One line each, with the evidence: body page range and excluded blocks,
     parser backend, structure rows decided,
     figures dropped or kept against the classifier, preamble counter, lint
-    waivers, allowlisted commands, in-place LaTeX fixes.
+    waivers, allowlisted commands, in-place LaTeX fixes, every fix made
+    by a chunk or page verifier (location, kind, before → after; for a
+    parse error, the page it was read from), and every figure whose Chinese
+    text was translated (figure number, method).
 
     ## Assumptions
     Things taken as true without checking, and why.
@@ -253,14 +341,20 @@ the English cover page (`book_meta.json`, typeset at assembly).
     ## Known limitations
     Always include: semantic lint checks translation drift, not parse
     fidelity — a parser hallucination (e.g. a wrong exponent from the VLM)
-    would pass every check. Plus anything specific to this book.
+    would pass every check. Page images are compared only where a chunk
+    verifier flagged an equation, so a parse error that reads plausibly is
+    still missed. Chinese text inside figures is found by the image
+    classifier (Haiku, low effort), which can miss a very small label.
+    Plus anything specific to this book.
 
     ## Spot-check list for a human
     The 5–10 pages most worth eyeballing, with why.
 
     ## Run statistics
     Subagents spawned by type, exchange requests by role, retries, lint
-    rounds, build attempts, MinerU pages spent.
+    rounds, build attempts, MinerU pages spent, verifier findings by kind
+    and action, page-check verdicts, figures with Chinese text by method
+    and outcome.
 
 ## Command and file reference
 
@@ -280,7 +374,7 @@ sample parse into another work dir uses the same command with a page range
 covering only the sample pages.
 
 **Run state.** `uv run python scripts/run_state.py data/work/<book>` then one
-of: `show` · `set stage <preflight|page-range|parse|prepare|translate|lint|build|publish|done|stopped>`
+of: `show` · `set stage <preflight|page-range|parse|prepare|translate|lint|verify|figure-text|build|publish|done|stopped>`
 · `set mode claude-code|agent-sdk` · `set backend exchange|anthropic` ·
 `sync-chunks` · `set chunk NNN [NNN ...] translated|failed|pending|gap [--error "..."]`
 · `build ok|failed [--message "..."]` · `decide "<what>" --evidence "<evidence>"`.
@@ -302,3 +396,22 @@ file.
 **Translated chunks.** Every reply ends with the line `% END-OF-CHUNK`; lint
 reports a reply without it as `truncated-sentinel`. In API mode a failed reply
 is kept as `translated/NNN.failed.tex` for inspection.
+
+**Verification** (`kit/verify/`): `NNN.json` from `chunk-verifier`
+(`findings`, each with `kind`, `severity` `major|minor`, `action`
+`fixed|page-check|left`, the exact `source_excerpt` / `translation_excerpt`
+and, when fixed, `fixed_text`); `NNN.pages.json` from `page-verifier`
+(`checks`, each with `finding`, `verdict`
+`translation-error|parse-error|no-error|unresolved`, `source_fix` /
+`translation_fix`); `page_checks.json` and `pages/pNNNN.png` from
+`verify_kit.py pages` (original physical page numbers). `verify_kit.py
+report --json` writes the full report to `kit/logs/verify.txt`.
+
+**Figure text** (`kit/figure_text/`): `tasks.json` from `figure_text.py
+tasks`; per image `<stem>.json` (the agent's spec: `image`, `method`
+`tikz|overlay|legend`, `labels` with `zh` / `en` and, for an overlay, `box`
+`[x0, y0, x1, y1]` as fractions of the image from the top left, for a legend
+`where`; `accepted`; `notes`), `<stem>.tex`, `<stem>.pdf`,
+`<stem>.preview.png` and `<stem>.render.json`. Assembly uses `<stem>.pdf` in
+place of the scan only when the spec is accepted and unchanged since a
+successful render.

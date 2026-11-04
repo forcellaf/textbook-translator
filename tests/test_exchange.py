@@ -179,12 +179,14 @@ def test_every_figure_request_is_emitted_in_one_pass(tmp_path: Path) -> None:
         BOOK, images_dir=work / "images", vision=ExchangeLLM("classify", work)
     )
 
+    # Every kept image is asked (captioned ones for Chinese text only); only
+    # the uncaptioned candidates are flagged while their answer is pending.
     candidates = [name for name in ("glyph.png", "loose.png")]
-    assert len(pending_requests(work)["classify"]) == len(candidates)
-    assert report.pending == len(candidates)
-    for name in candidates:
-        record = report.records[name]
-        assert record.keep and FLAG_PENDING in record.flags
+    assert len(pending_requests(work)["classify"]) == len(report.records) == 3
+    assert report.pending == 3
+    for name, record in report.records.items():
+        assert record.keep
+        assert (FLAG_PENDING in record.flags) == (name in candidates)
 
 
 def test_a_malformed_answer_keeps_the_figure_and_is_never_re_requested(tmp_path: Path) -> None:

@@ -73,8 +73,11 @@ headless session transcript goes to `logs/`.
 | Stage 2 runner (prepare kit) | `claude-sonnet-5-5` | `medium` | subagent |
 | Book profile (glossary + heading levels) | `claude-sonnet-5-5` | `medium` | LLM call |
 | Structure labelling + follow-ups | `claude-sonnet-5-5` | `medium` | LLM call |
-| Figure classification (vision) | `claude-haiku-5-5` | `low` | LLM call |
+| Figure classification + Chinese text in images (vision) | `claude-haiku-5-5` | `low` | LLM call |
 | Chunk translation | `claude-haiku-5-5` | `medium` | LLM call |
+| Meaning verification, one per chunk | `claude-sonnet-5-5` | `high` | subagent |
+| Page check of a flagged equation (vision) | `claude-opus-5-5` | `medium` | subagent |
+| Figure text: TikZ redraw / overlay / legend (vision) | `claude-opus-5-5` | `medium` | subagent |
 | Digesting long output (lint, build logs, parse logs) | `claude-sonnet-5-5` | `medium` | subagent |
 
 An "LLM call" is made by Python through the Messages API in API mode, and by
@@ -573,6 +576,51 @@ Three behaviours are deliberate:
   strictly alternate.
 
 Lint one file with `--tex one_chunk.tex` or `--markdown merged.md`.
+
+## Stage 3b — Meaning verification
+
+Lint compares the mathematics token by token; it does not read the prose.
+A `chunk-verifier` (Sonnet) reads each translated chunk against its source,
+fixes omissions, additions, mistranslations and lost negations in place, and
+records every change in `kit/verify/NNN.json`. It never edits mathematics: a
+major equation problem goes to a `page-verifier` (Opus), which reads the
+printed page and fixes the translation, or the source chunk too when the
+parser misread the page.
+
+```bash
+uv run python scripts/verify_kit.py data/work/physics/kit report --json   # what to verify, and the log summary
+uv run python scripts/verify_kit.py data/work/physics/kit pages --json    # locate + render pages for page checks
+```
+
+The results go to the run log only; they never gate the build.
+
+## Stage 3c — Text inside figures
+
+The figure classifier also answers, for every kept image (captioned ones
+too), whether Chinese text is printed inside it (`chinese_text` in
+`figures.json`). Each such figure goes to a `diagram-translator` (Opus, with
+the [diagram-translation](.claude/skills/diagram-translation/SKILL.md) skill),
+which picks one of three methods:
+
+- **`tikz`**: redraws a line drawing (circuit, force diagram, plot) in TikZ
+  with English labels;
+- **`overlay`**: keeps the scan and sets the English labels over the Chinese
+  ones;
+- **`legend`**: the fallback; keeps the scan and adds an English legend under
+  it.
+
+The agent then renders its result, compares it with the original, and accepts
+it.
+
+```bash
+uv run python scripts/figure_text.py data/work/physics/kit tasks --json
+uv run python scripts/figure_text.py data/work/physics/kit render <stem> --json
+uv run python scripts/figure_text.py data/work/physics/kit report --json
+```
+
+Assembly uses `kit/figure_text/<stem>.pdf` in place of the scan only when its
+spec is accepted and unchanged since a successful render; otherwise the
+original image is printed, and the run log says so.
 
 ## Stage 4 — Build and publish
 

@@ -28,7 +28,7 @@ Digest (your final message, at most ~60 lines):
 - the printed structure outline, with every `<-- CHECK` row kept verbatim;
 - any first-chapter / `\setcounter` warning;
 - figure counts (captioned / panels / candidates / dropped / flagged /
-  default-width) and the path of `figures_review.html`;
+  default-width / Chinese text inside) and the path of `figures_review.html`;
 - tables left as HTML, with their reasons;
 - chunk count;
 - exchange requests answered, by role;

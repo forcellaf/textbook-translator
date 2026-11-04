@@ -35,6 +35,7 @@ from src.figures import (
     caption_number,
     link_images,
     linked_entries,
+    parse_verdict,
     load_figures,
     save_figures,
     scan_markdown,
@@ -69,14 +70,18 @@ class FakeVisionLLM(VisionLLM):
         assert mime == "image/png"
         name = data[len(PNG_HEADER) :].decode()
         self.seen.append(name)
-        reply = self.replies[name]
+        # Captioned images are asked too (for Chinese text); unless a test
+        # says otherwise they are plain figures with no text inside.
+        reply = self.replies.get(name, _verdict("figure", 0.99))
         if isinstance(reply, Exception):
             raise reply
         return reply
 
 
-def _verdict(label: str, confidence: float) -> str:
-    return json.dumps({"label": label, "confidence": confidence, "reason": "test"})
+def _verdict(label: str, confidence: float, chinese_text: bool = False) -> str:
+    return json.dumps(
+        {"label": label, "confidence": confidence, "chinese_text": chinese_text, "reason": "test"}
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -434,10 +439,52 @@ def test_confident_decoration_in_a_numbering_gap_is_kept(tmp_path: Path) -> None
     assert report.records["glyph.jpg"].keep is False  # 18.1 follows it: no gap
 
 
-def test_captioned_images_and_panels_never_reach_the_classifier(tmp_path: Path) -> None:
-    _, fake = _classify(tmp_path, {"glyph.jpg": FIGURE_LOST, "lost.jpg": FIGURE_LOST})
+def test_captioned_images_and_panels_are_asked_but_never_dropped(tmp_path: Path) -> None:
+    report, fake = _classify(
+        tmp_path,
+        {
+            "glyph.jpg": FIGURE_LOST,
+            "lost.jpg": FIGURE_LOST,
+            "f1.jpg": _verdict("decoration", 0.99, chinese_text=True),
+            "a.jpg": RuntimeError("boom"),
+        },
+    )
 
-    assert sorted(fake.seen) == ["glyph.jpg", "lost.jpg"]
+    expected = ["glyph.jpg", "f1.jpg", "f2.jpg", "f3.jpg", "lost.jpg", "a.jpg", "b.jpg"]
+    assert sorted(set(fake.seen)) == sorted(expected)  # the failing call is retried
+    f1 = report.records["f1.jpg"]
+    # The fixture has no layout data, hence no-bbox; nothing from the classifier.
+    assert f1.keep is True and f1.label == "decoration" and f1.flags == ["no-bbox"]
+    assert f1.chinese_text is True
+    assert report.records["a.jpg"].flags == ["no-bbox"]  # a failed call on a panel flags nothing
+    assert report.chinese_text == ["f1.jpg"]
+    assert "Chinese text inside: 1 kept image(s)" in report.render()
+    assert report.label_counts() == {"figure": 2}  # captioned labels are not candidates
+
+
+def test_chinese_text_is_never_reported_for_a_dropped_image(tmp_path: Path) -> None:
+    report, _ = _classify(
+        tmp_path, {"glyph.jpg": _verdict("decoration", 0.95, chinese_text=True), "lost.jpg": FIGURE_LOST}
+    )
+    assert report.records["glyph.jpg"].keep is False
+    assert report.chinese_text == []
+
+
+def test_a_cached_label_without_the_text_answer_is_asked_again(tmp_path: Path) -> None:
+    old = {
+        "glyph.jpg": FigureRecord(label="decoration", confidence=0.95, keep=False),
+        "lost.jpg": FigureRecord(label="figure", confidence=0.9, chinese_text=False),
+    }
+    report, fake = _classify(tmp_path, {}, existing=old)
+
+    assert "glyph.jpg" in fake.seen and "lost.jpg" not in fake.seen
+    assert report.records["glyph.jpg"].chinese_text is False
+
+
+def test_a_reply_without_the_text_answer_is_still_a_verdict() -> None:
+    verdict = parse_verdict('{"label": "figure", "confidence": 0.9, "reason": "x"}')
+    assert verdict.label == "figure" and verdict.chinese_text is None and verdict.flag is None
+    assert parse_verdict(_verdict("figure", 0.9, chinese_text=True)).chinese_text is True
 
 
 def test_dry_run_labels_but_drops_nothing(tmp_path: Path) -> None:
@@ -494,7 +541,7 @@ def test_reclassify_asks_again_but_leaves_manual_entries_alone(tmp_path: Path) -
         reclassify=True,
     )
 
-    assert fake.seen == ["glyph.jpg"]
+    assert "glyph.jpg" in fake.seen and "lost.jpg" not in fake.seen  # manual: never asked
     assert second.records["glyph.jpg"].label == "decoration"
     assert second.records["glyph.jpg"].keep is False
     assert second.records["lost.jpg"] == existing["lost.jpg"]

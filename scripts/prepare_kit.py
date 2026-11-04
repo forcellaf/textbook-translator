@@ -324,6 +324,7 @@ def _prepare(args: argparse.Namespace, summary: dict) -> int:
         "flagged": len(figures.flagged),
         "default_width": len(figures.defaulted),
         "labels": dict(figures.label_counts()),
+        "chinese_text": len(figures.chinese_text),
         "classifier_calls": figures.calls,
         "awaiting_answers": figures.pending,
         "note": note,

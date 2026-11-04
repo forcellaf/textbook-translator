@@ -15,6 +15,12 @@ not. A record says three things the translation cannot be trusted with:
 ``width``
     The figure's width on the source page as a fraction of the body-text
     width, so a figure that was small in the original is small in the PDF.
+``chinese_text``
+    Whether Chinese text is printed *inside* the image (labels, axis titles,
+    annotations). Every kept image is asked, captioned or not, so that
+    ``src.figure_text`` can send those images to be redrawn or overlaid in
+    English. On a captioned image the classifier's label is information
+    only: the drop rule applies to uncaptioned images alone.
 ``keep``
     Whether it is a figure at all. Decorations, text rendered as an image
     and crop fragments are dropped -- but only on a confident classifier
@@ -149,6 +155,8 @@ class FigureRecord:
     # panel (a) of a figure whose one caption sits under panel (b).
     panel_of: str | None = None
     flags: list[str] = field(default_factory=list)
+    # Chinese text printed inside the image; None = not asked (yet).
+    chinese_text: bool | None = None
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -167,6 +175,7 @@ class FigureRecord:
             reason=_str_or_none(data.get("reason")),
             panel_of=_str_or_none(data.get("panel_of")),
             flags=[str(f) for f in data.get("flags") or []],
+            chinese_text=data["chinese_text"] if isinstance(data.get("chinese_text"), bool) else None,
         )
 
 
@@ -557,8 +566,14 @@ A faint or low-contrast line drawing is still a "figure": printing can be very l
 Dropping a real figure loses content from the book, so only answer "decoration" when the image \
 carries no information at all. Give your actual certainty: 0.95 or more only when there is no doubt.
 
+Separately, say whether Chinese text is printed inside the image: Chinese characters in labels, axis \
+titles, annotations, legends, table cells or speech bubbles. Latin letters, Greek letters, numbers, \
+units and mathematical symbols do not count. Look closely: labels are often small. Answer true even \
+for a single character (甲, 乙, 电源).
+
 Reply with JSON only, no other text:
-{"label": "figure" | "decoration" | "text_as_image" | "fragment", "confidence": 0.0-1.0, "reason": "<one sentence>"}"""
+{"label": "figure" | "decoration" | "text_as_image" | "fragment", "confidence": 0.0-1.0, \
+"chinese_text": true | false, "reason": "<one sentence>"}"""
 
 
 @dataclass(frozen=True)
@@ -567,6 +582,7 @@ class Verdict:
     confidence: float | None
     reason: str | None
     flag: str | None = None  # FLAG_MALFORMED / FLAG_ERROR when it failed
+    chinese_text: bool | None = None  # None: the reply did not say
 
 
 def _user_text(site: ImageSite) -> str:
@@ -597,10 +613,12 @@ def parse_verdict(raw: str) -> Verdict:
     ):
         return Verdict(None, None, f"malformed reply: {raw[:120]!r}", FLAG_MALFORMED)
     reason = data.get("reason")
+    chinese_text = data.get("chinese_text")
     return Verdict(
         str(label),
         max(0.0, min(1.0, float(confidence))),
         str(reason).strip() if reason else None,
+        chinese_text=chinese_text if isinstance(chinese_text, bool) else None,
     )
 
 
@@ -736,6 +754,11 @@ class FiguresReport:
         return [n for n, r in self._ordered() if r.by == BY_DEFAULT]
 
     @property
+    def chinese_text(self) -> list[str]:
+        """Kept images with Chinese text inside, for ``src.figure_text``."""
+        return [n for n, r in self._ordered() if r.keep and r.chinese_text]
+
+    @property
     def would_drop(self) -> list[str]:
         return [n for n, r in self._ordered() if FLAG_WOULD_DROP in r.flags]
 
@@ -776,6 +799,12 @@ class FiguresReport:
                 lines.append(
                     f"    {name}  {record.label or record.by} {confidence}  {record.reason or ''}"
                 )
+        if self.mode != MODE_OFF:
+            unknown = sum(1 for r in records if r.keep and r.chinese_text is None)
+            lines.append(
+                f"  Chinese text inside: {len(self.chinese_text)} kept image(s)"
+                + (f", {unknown} not asked" if unknown else "")
+            )
         flags = Counter(f for r in records for f in r.flags)
         if flags:
             lines.append("  flags: " + ", ".join(f"{k} {v}" for k, v in sorted(flags.items())))
@@ -857,23 +886,28 @@ def build_figures(
 
     in_gap = numbering_gaps(sites, numbers)
 
-    # Pass 2: classify what is left, reusing cached labels. On the exchange
+    # Pass 2: classify every image, reusing cached answers. On the exchange
     # backend every unanswered image becomes a request in this one pass.
+    # Captioned images and sub-panels are asked too, but only for whether
+    # they hold Chinese text: their label never drops them.
     calls = 0
     pending = 0
     stopped: str | None = None
     last_call = 0.0
     for site in sites:
         record = records.get(site.name)
-        if record is None or record.number or record.panel_of:
+        if record is None:
             continue
+        candidate = not (record.number or record.panel_of)
         cached = existing.get(site.name)
-        if cached and cached.label in LABELS and not reclassify:
+        # A cached answer from before the text question was asked is asked again.
+        if cached and cached.label in LABELS and cached.chinese_text is not None and not reclassify:
             record.label, record.confidence, record.reason = (
                 cached.label,
                 cached.confidence,
                 cached.reason,
             )
+            record.chinese_text = cached.chinese_text
         elif mode != MODE_OFF and vision is not None and stopped is None:
             image = _read_image(images_dir, site.name)
             if image is None:
@@ -901,9 +935,20 @@ def build_figures(
                 verdict.confidence,
                 verdict.reason,
             )
-            if verdict.flag:
+            record.chinese_text = verdict.chinese_text
+            # A captioned image is kept whatever happened, so a failed call
+            # is not a reason to flag it for review.
+            if verdict.flag and candidate:
                 record.flags.append(verdict.flag)
-        decide(record, in_gap=site.name in in_gap, mode=mode, threshold=threshold)
+        elif cached and cached.label in LABELS and not reclassify:
+            # No classifier this run (or it stopped): keep the old label.
+            record.label, record.confidence, record.reason = (
+                cached.label,
+                cached.confidence,
+                cached.reason,
+            )
+        if candidate:
+            decide(record, in_gap=site.name in in_gap, mode=mode, threshold=threshold)
 
     for record in records.values():
         record.by = settle_by(record)
