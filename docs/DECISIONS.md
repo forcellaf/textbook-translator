@@ -259,6 +259,66 @@ shared overlay, which both launchers use.
 **`.claude/settings.local.json` and `.claude/worktrees/` are gitignored**; the
 shared settings, skill and agents are tracked.
 
+## Phase 6 — meaning verification (Step 4b)
+
+**Why a second model reads every chunk.** Lint and fidelity are deterministic
+and only compare mathematics; a dropped sentence, a lost negation or a wrong
+term passes them all. The translator is the cheapest model in the pipeline
+(Haiku, medium), so `chunk-verifier` is Sonnet at high effort: a different,
+stronger model, not the translator grading itself.
+
+**Log only, never a gate.** Verifier findings do not block the build and are
+not lint findings, so they need no waivers. `verify_kit.py report` exits 1
+only when a result *file* is malformed (the agent is re-asked once).
+
+**Agents only, no `verify` LLM role.** There is no API-backend path: the
+verifiers are subagents in both run modes (the Agent SDK launcher runs the
+same skill, so subagents are available there too).
+
+**Verifiers fix in place.** `chunk-verifier` edits prose itself and records
+every change (before / after) in `kit/verify/NNN.json`; the orchestrator
+copies each into the run log's Decisions. It never edits mathematics: a major
+`formula` or `source-suspect` finding goes to a page check instead, because
+the source chunk is the parser's reading of the page and may be the side that
+is wrong. A minor one is only logged.
+
+**Page checks are a separate agent, Opus at medium effort.** Reading a
+superscript off a 200 dpi scan is where a mistake costs most, and page checks
+are rare (only flagged equations), so the strongest vision model is used.
+`verify_kit.py pages` does the deterministic part -- finding the page through
+`content_list.json`'s `page_idx` and rendering it -- so the agent needs no Bash.
+
+**A confirmed parse error is fixed in the source chunk as well.** If only the
+translation were corrected, the fidelity lint would report the corrected value
+as drift from the (wrong) source and need a waiver. Editing `chunks/NNN.md`
+keeps both sides matching the book. The cost: re-running `prepare_kit.py`
+regenerates `chunks/` and loses the source fix, after which fidelity reports
+the corrected translation -- visible, not silent. The skill's "never change
+the tool" list now names `kit/chunks/*.md` for this case only.
+
+**Excerpts are checked, not trusted.** Every quoted excerpt and every fix's
+new text is looked up in its file (whitespace and `$` removed). A miss is a
+`flag` on the finding, shown in the log beside it, never a silent drop: a
+verifier that quotes text that is not there is itself information. Agents
+writing LaTeX into JSON often forget to double a backslash (`\frac` becomes a
+form feed + "rac" and still parses), so the lookup also tries the text with
+those escapes repaired.
+
+**Locating the page.** A short excerpt (under 40 characters once compacted,
+e.g. `F=ma`) is matched by its whole paragraph, which occurs once. Blocks on
+the chunk's own pages (the 10th–90th percentile of pages its lines are found
+on) are searched first; the whole book only if they have no match. With no
+match at all, the page is interpolated from the excerpt's position in the
+chunk and reported as `interpolated`, which tells the page verifier to check
+that the passage really is on the image. Images are named by the *original*
+physical page number, the one a human would look up.
+
+**Re-verification is explicit.** Results are not tied to a hash of the
+translation, because lint `--fix` and the orchestrator's own in-place repairs
+legitimately change the file after verification. A chunk is "verified" when
+`verify/NNN.json` exists; the skill says to delete it when a verified chunk is
+re-translated (which would discard the verifiers' fixes, so it is avoided).
+
 ## End-to-end check (no quota)
 
 Run on 2026-10-11 against a scratch copy of `eee_1` (`data/work/eee_1_e2e`,

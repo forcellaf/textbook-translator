@@ -22,6 +22,8 @@ EXPECTED = {
     "figure-classifier": ("claude-haiku-5-5", "low", {"Read", "Write"}),
     "chunk-translator": ("claude-haiku-5-5", "medium", {"Read", "Write"}),
     "output-digester": ("claude-sonnet-5-5", "medium", {"Read", "Grep"}),
+    "chunk-verifier": ("claude-sonnet-5-5", "high", {"Read", "Write", "Edit"}),
+    "page-verifier": ("claude-opus-5-5", "medium", {"Read", "Write", "Edit"}),
 }
 
 

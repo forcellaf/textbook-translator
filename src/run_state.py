@@ -38,6 +38,7 @@ STAGES: tuple[str, ...] = (
     "prepare",
     "translate",
     "lint",
+    "verify",
     "build",
     "publish",
     "done",
