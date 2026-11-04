@@ -308,6 +308,13 @@ def assemble(kit_dir: Path) -> tuple[Path, list[str]]:
         if figures_path.exists():
             merged, figure_problems = apply_figures(merged, mapping, load_figures(figures_path))
             problems += figure_problems
+        # Figures whose Chinese labels were redrawn or overlaid in English
+        # (src.figure_text) point at their English PDF; the rest at the scan.
+        from src.figure_text import substitute
+
+        mapping, swapped = substitute(mapping, kit_dir)
+        if swapped:
+            logger.info("Figures: %d with English labels from figure_text/", swapped)
         merged, unknown = restore_images(merged, mapping)
         if unknown:
             problems.append(

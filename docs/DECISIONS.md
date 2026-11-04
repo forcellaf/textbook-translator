@@ -319,6 +319,76 @@ legitimately change the file after verification. A chunk is "verified" when
 `verify/NNN.json` exists; the skill says to delete it when a verified chunk is
 re-translated (which would discard the verifiers' fixes, so it is avoided).
 
+## Phase 7 — Chinese text inside figures (Step 4c)
+
+**The classifier asks every kept image, not only uncaptioned ones.** Its
+job was deciding drops, so captioned images and sub-panels never reached it
+-- and they are most of the diagrams with labels. Now each gets one call
+with the extended prompt (`"chinese_text": true|false`). On a captioned
+image the label is information only: `decide()` still runs on uncaptioned
+candidates alone, a failed call does not flag a captioned image for review,
+and `label_counts()` still counts candidates only. Costs one Haiku call per
+captioned image, once (answers are cached in `figures.json`).
+
+**A cached label without a text answer is asked again.** Books classified
+before this change have labels but no `chinese_text`; reusing those would
+mean their figures are never checked. A reply that omits the field is still
+a valid verdict (`chinese_text: null`), not a malformed one, so the drop
+decision never depends on it. Protected (`manual` / `agent`) records are not
+re-asked; `figure_text.py tasks` lists them as `not_asked` and the
+orchestrator looks at up to ten itself.
+
+**Runs after translation and verification, before the build.** Labels should
+use the translation's own terms ("source", not "power supply", if that is
+what the prose says), so the agent gets the translated text around the
+figure. It changes nothing the lint reads.
+
+**Three methods, the agent picks per image; the original + legend is the
+fallback.** `tikz` redraws line drawings (sharper than the scan, but a
+redraw can move a line, so every TikZ figure goes into the spot-check list);
+`overlay` keeps the scan and paints English over each label's box;
+`legend` keeps the scan unchanged and adds an English legend under it. The
+legend names labels by position ("upper left: source") because the book's
+pdflatex preamble cannot set Chinese, so it cannot quote the original. If
+even that fails, the original scan is printed and the run log says so.
+
+**Every method ends as a standalone PDF swapped in at assembly.** No change
+to the preamble or to `\bookfigx`: `src.kit.assemble` points the figure's
+token at `figure_text/<stem>.pdf` instead of the scan (the preamble's
+`\graphicspath{{images/}{./}}` finds it), so width, number, caption and
+panels work as before, inline figures in table cells included. A TikZ error
+cannot break the book build: each figure is compiled on its own first.
+
+**Drawn at book size.** The standalone page is the figure's width in the
+book (`figures.json` width x 16 cm, the A4 text width with 2.5 cm margins),
+so a `\footnotesize` label is printed at that size instead of being scaled
+with a 2000-pixel scan.
+
+**The agent checks its own render.** `figure_text.py render` compiles and
+writes `<stem>.preview.png`; the agent compares it with the original, at most
+three renders per method, and sets `"accepted": true`. Assembly uses a PDF
+only if the spec is accepted *and* its hash (method, labels, TikZ source;
+not `accepted` / `notes`) matches the last successful render, so an edit
+after the check falls back to the scan instead of shipping something nobody
+looked at.
+
+**Opus at medium effort, one image per agent, at most 8 at a time.** Reading
+small labels and redrawing a diagram faithfully is the hardest vision task
+in the pipeline; one image per agent keeps the original and its previews
+the only images in its context. Switch the model to Sonnet in
+`.claude/agents/diagram-translator.md` if cost matters more than fidelity.
+
+**The know-how is a skill (`diagram-translation`), preloaded** through the
+agent's `skills:` frontmatter (supported by Claude Code 2.1.318, the
+installed CLI). The agent file holds the procedure; the skill holds how to
+choose, draw, estimate boxes and check, and can be improved on its own.
+
+**Not exercised:** pdflatex is not installed in the development container,
+so the generated overlay / legend sources and a TikZ redraw have not been
+compiled for real; the tests replace `run_pdflatex`. The first real run is
+where to confirm that `standalone` and `tikz` are present in the TeX
+installation.
+
 ## End-to-end check (no quota)
 
 Run on 2026-10-11 against a scratch copy of `eee_1` (`data/work/eee_1_e2e`,

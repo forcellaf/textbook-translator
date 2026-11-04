@@ -24,6 +24,7 @@ EXPECTED = {
     "output-digester": ("claude-sonnet-5-5", "medium", {"Read", "Grep"}),
     "chunk-verifier": ("claude-sonnet-5-5", "high", {"Read", "Write", "Edit"}),
     "page-verifier": ("claude-opus-5-5", "medium", {"Read", "Write", "Edit"}),
+    "diagram-translator": ("claude-opus-5-5", "medium", {"Read", "Write", "Edit", "Bash"}),
 }
 
 
@@ -60,3 +61,9 @@ def test_run_settings_deny_edits_to_the_tool_but_shared_settings_do_not() -> Non
     for path in ("src", "assets", "tests"):
         assert f"Edit(./{path}/**)" in overlay["permissions"]["deny"]
     assert int(overlay["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]) >= 64_000
+
+
+def test_the_diagram_translator_preloads_its_skill() -> None:
+    agent = _frontmatter(AGENTS / "diagram-translator.md")
+    skill = _frontmatter(ROOT / ".claude" / "skills" / agent["skills"] / "SKILL.md")
+    assert skill["name"] == agent["skills"] == "diagram-translation"
